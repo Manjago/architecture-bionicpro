@@ -36,6 +36,7 @@ public class ReportServer {
             config.showJavalinBanner = false;
         });
 
+        app.get("/reports/me", reportHandler::getMyReport);
         app.get("/reports/{userId}", reportHandler::getReport);
         app.get("/health", healthHandler::check);
 

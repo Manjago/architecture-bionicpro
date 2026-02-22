@@ -10,11 +10,13 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * GET /reports/{userId}
+ * Обработчик запросов на отчёты.
  * <p>
- * Возвращает агрегированный отчёт по протезам пользователя.
- * Авторизация: Bearer JWT → извлекаем sub (user_id) → сравниваем с {userId} в пути.
- * Пользователь может запрашивать только свой отчёт.
+ * Два endpoint'а:
+ * <ul>
+ *   <li>{@code GET /reports/me} — userId из JWT (основной, для фронтенда через BFF)</li>
+ *   <li>{@code GET /reports/{userId}} — userId из пути (проверяет совпадение с JWT sub)</li>
+ * </ul>
  */
 public class ReportHandler {
 
@@ -26,12 +28,63 @@ public class ReportHandler {
         this.ch = ch;
     }
 
+    /**
+     * GET /reports/me
+     * <p>
+     * Фронтенд вызывает /api/reports/me → BFF проксирует как /reports/me.
+     * userId извлекается из JWT claim "sub".
+     */
+    public void getMyReport(Context ctx) {
+        int userId = extractAndValidateToken(ctx);
+        if (userId < 0) return; // ответ уже отправлен
+
+        fetchAndReturnReport(ctx, userId);
+    }
+
+    /**
+     * GET /reports/{userId}
+     * <p>
+     * Прямой доступ по userId. Проверяет, что запрошенный userId совпадает
+     * с sub из JWT — пользователь может запрашивать только свой отчёт.
+     */
     public void getReport(Context ctx) {
-        // ── 1. Извлечь и проверить JWT ─────────────────────────────────
+        int tokenUserId = extractAndValidateToken(ctx);
+        if (tokenUserId < 0) return; // ответ уже отправлен
+
+        // Проверить авторизацию: отчёт только по себе
+        String requestedParam = ctx.pathParam("userId");
+        int requestedUserId;
+        try {
+            requestedUserId = Integer.parseInt(requestedParam);
+        } catch (NumberFormatException e) {
+            ctx.status(400).json(Map.of("error", "userId must be a number"));
+            return;
+        }
+
+        if (tokenUserId != requestedUserId) {
+            log.warn("Access denied: token sub={} requested userId={}",
+                    tokenUserId, requestedUserId);
+            ctx.status(403).json(Map.of(
+                    "error", "Access denied. You can only view your own report."
+            ));
+            return;
+        }
+
+        fetchAndReturnReport(ctx, requestedUserId);
+    }
+
+    // ── Shared logic ───────────────────────────────────────────────────
+
+    /**
+     * Извлекает и валидирует JWT из Authorization header.
+     *
+     * @return userId (>= 0) при успехе, -1 при ошибке (ответ уже отправлен)
+     */
+    private int extractAndValidateToken(Context ctx) {
         String authHeader = ctx.header("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             ctx.status(401).json(Map.of("error", "Missing or invalid Authorization header"));
-            return;
+            return -1;
         }
 
         String token = authHeader.substring("Bearer ".length());
@@ -41,38 +94,27 @@ public class ReportHandler {
         } catch (Exception e) {
             log.warn("Failed to parse JWT: {}", e.getMessage());
             ctx.status(401).json(Map.of("error", "Invalid token"));
-            return;
+            return -1;
         }
 
-        // ── 2. Извлечь user_id из JWT (claim "sub") ───────────────────
         Object subClaim = claims.get("sub");
         if (subClaim == null) {
             ctx.status(401).json(Map.of("error", "Token missing 'sub' claim"));
-            return;
-        }
-        String tokenUserId = subClaim.toString();
-
-        // ── 3. Проверить авторизацию: отчёт только по себе ─────────────
-        String requestedUserId = ctx.pathParam("userId");
-
-        if (!tokenUserId.equals(requestedUserId)) {
-            log.warn("Access denied: token sub={} requested userId={}",
-                    tokenUserId, requestedUserId);
-            ctx.status(403).json(Map.of(
-                    "error", "Access denied. You can only view your own report."
-            ));
-            return;
+            return -1;
         }
 
-        // ── 4. Запросить отчёт из ClickHouse ──────────────────────────
-        int userId;
         try {
-            userId = Integer.parseInt(requestedUserId);
+            return Integer.parseInt(subClaim.toString());
         } catch (NumberFormatException e) {
-            ctx.status(400).json(Map.of("error", "userId must be a number"));
-            return;
+            ctx.status(400).json(Map.of("error", "JWT sub is not a valid user ID"));
+            return -1;
         }
+    }
 
+    /**
+     * Запрашивает отчёт из ClickHouse и возвращает JSON.
+     */
+    private void fetchAndReturnReport(Context ctx, int userId) {
         try {
             List<Map<String, Object>> rows = ch.queryUserReport(userId);
 
@@ -85,7 +127,6 @@ public class ReportHandler {
                 return;
             }
 
-            // ── 5. Сформировать ответ ──────────────────────────────────
             // Первая строка содержит имя/email (одинаковые для всех prosthesis_type)
             String customerName = rows.getFirst().getOrDefault("customer_name", "").toString();
             String customerEmail = rows.getFirst().getOrDefault("customer_email", "").toString();
