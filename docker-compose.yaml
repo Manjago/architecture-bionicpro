@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # === Auth Layer (NEW — Sprint 9, Task 1) ===
+  # === Auth Layer (Sprint 9, Task 1) ===
   bionicpro-auth:
     build:
       context: ./bionicpro-auth
@@ -14,8 +14,8 @@ services:
       KEYCLOAK_CLIENT_ID: reports-frontend
       KEYCLOAK_CLIENT_SECRET: bff-client-secret-change-me
       FRONTEND_URL: http://localhost:3000
-      API_BASE_URL: http://report-service:8002
-      REPORT_SERVICE_URL: http://report-service:8002
+      API_BASE_URL: http://report-service:8001
+      REPORT_SERVICE_URL: http://report-service:8001
       # CALLBACK_URL — используется для redirect_uri.
       # Должен быть внешним URL (как видит браузер), НЕ внутренним Docker-сетевым.
       CALLBACK_URL: http://localhost:8000/auth/callback
@@ -24,6 +24,22 @@ services:
       PORT: "8000"
     depends_on:
       - keycloak
+      - report-service
+
+  # === Report Service (Sprint 9, Task 2) ===
+  report-service:
+    build:
+      context: ./report-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      PORT: "8001"
+      CLICKHOUSE_HOST: olap_db
+      CLICKHOUSE_PORT: "8123"
+    depends_on:
+      olap_db:
+        condition: service_healthy
 
   # === Identity Provider ===
   keycloak_db:
@@ -96,7 +112,7 @@ services:
     ports:
       - "5444:5432"
 
-  # === OLAP Database ===
+  # === OLAP Database (ClickHouse) ===
   olap_db:
     image: clickhouse/clickhouse-server:latest
     ports:
@@ -113,7 +129,7 @@ services:
       timeout: 3s
       retries: 30
 
-  # === Object Storage ===
+  # === Object Storage (Task 3) ===
   minio:
     image: minio/minio
     ports:
@@ -125,6 +141,64 @@ services:
       MINIO_ROOT_USER: minio_user
       MINIO_ROOT_PASSWORD: minio_password
     command: server --console-address ":9001" /data
+
+  # === Airflow (Sprint 9, Task 2 — ETL) ===
+  airflow_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - ./postgres-airflow-data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+
+  airflow-init:
+    image: apache/airflow:2.8.1
+    entrypoint: /bin/bash
+    command: >
+      -c "airflow db init &&
+          airflow users create
+            --username admin --password admin
+            --firstname Admin --lastname User
+            --role Admin --email admin@example.com"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-driver psycopg2-binary"
+    depends_on:
+      - airflow_db
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    command: webserver
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__WARN_DEPLOYMENT_EXPOSURE: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-driver psycopg2-binary"
+    depends_on:
+      - airflow-init
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-driver psycopg2-binary"
+    depends_on:
+      - airflow-init
 
 volumes:
   minio_storage: {}
