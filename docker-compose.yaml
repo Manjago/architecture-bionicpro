@@ -1,6 +1,31 @@
 version: '3.8'
 
 services:
+  # === Auth Layer (NEW — Sprint 9, Task 1) ===
+  bionicpro-auth:
+    build:
+      context: ./bionicpro-auth
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: reports-realm
+      KEYCLOAK_CLIENT_ID: reports-frontend
+      KEYCLOAK_CLIENT_SECRET: bff-client-secret-change-me
+      FRONTEND_URL: http://localhost:3000
+      API_BASE_URL: http://report-service:8002
+      REPORT_SERVICE_URL: http://report-service:8002
+      # CALLBACK_URL — используется для redirect_uri.
+      # Должен быть внешним URL (как видит браузер), НЕ внутренним Docker-сетевым.
+      CALLBACK_URL: http://localhost:8000/auth/callback
+      SESSION_COOKIE_NAME: BIONIC_SESSION
+      SESSION_TTL_SECONDS: "1800"
+      PORT: "8000"
+    depends_on:
+      - keycloak
+
+  # === Identity Provider ===
   keycloak_db:
     image: postgres:14
     environment:
@@ -11,6 +36,7 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,15 +46,17 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+      - ./keycloak/keycloak-results-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
       - "8080:8080"
     depends_on:
       - keycloak_db
+
+  # === Frontend ===
   frontend:
     build:
       context: ./frontend
@@ -36,7 +64,67 @@ services:
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+      # BFF-паттерн: фронтенд НЕ знает про Keycloak.
+      # Все запросы идут через BFF (bionicpro-auth).
+      REACT_APP_BFF_URL: http://localhost:8000
+
+  # === LDAP (Task 1.4) ===
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    command: --copy-service
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/50-bootstrap.ldif
+    environment:
+      - LDAP_ORGANISATION=example-com
+      - LDAP_DOMAIN=example.com
+      - LDAP_ADMIN_PASSWORD=admin
+    ports:
+      - "389:389"
+      - "636:636"
+
+  # === CRM Database ===
+  crm_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm_db
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+      - ./crm-db:/docker-entrypoint-initdb.d
+      - ./postgres-crm-data:/var/lib/postgresql/data
+    ports:
+      - "5444:5432"
+
+  # === OLAP Database ===
+  olap_db:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9431:9000"
+    volumes:
+      - ./clickhouse-data:/var/lib/clickhouse
+      - ./olap-db:/docker-entrypoint-initdb.d
+      - ./olap-db:/var/lib/clickhouse/user_files
+      - ./olap-db/users.xml:/etc/clickhouse-server/users.d/users.xml
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # === Object Storage ===
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_storage:/data
+    environment:
+      MINIO_ROOT_USER: minio_user
+      MINIO_ROOT_PASSWORD: minio_password
+    command: server --console-address ":9001" /data
+
+volumes:
+  minio_storage: {}
