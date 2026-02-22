@@ -8,7 +8,7 @@
 
 | # | Задание | Суть | Статус |
 |---|---------|------|--------|
-| 1 | Повышение безопасности | BFF + PKCE + LDAP + MFA + Яндекс ID | 🔧 В работе |
+| 1 | Повышение безопасности | BFF + PKCE + LDAP + MFA + Яндекс ID | ✅ Готово |
 | 2 | Сервис отчётов | Airflow ETL → ClickHouse → Report API | ⏳ |
 | 3 | Снижение нагрузки на БД | S3 + CDN (Nginx) кэширование отчётов | ⏳ |
 | 4 | Оперативность CRM | CDC через Debezium → Kafka → ClickHouse | ⏳ |
@@ -17,11 +17,41 @@
 
 ```
 architecture-bionicpro/
-├── bionicpro-auth/          ← Задание 1: BFF-сервис (Java)
+├── bionicpro-auth/          ← Задание 1: BFF-сервис (Java 25, Javalin)
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/bionicpro/auth/
+│       ├── AuthServer.java              ← Точка входа, роутинг, конфиг из env
+│       ├── handler/
+│       │   ├── LoginHandler.java        ← GET /auth/login (PKCE + redirect)
+│       │   ├── CallbackHandler.java     ← GET /auth/callback (token exchange)
+│       │   ├── LogoutHandler.java       ← POST /auth/logout
+│       │   └── ProxyHandler.java        ← GET/POST /api/** (session + proxy)
+│       ├── session/
+│       │   ├── SessionStore.java        ← Interface (→ Redis в проде)
+│       │   ├── InMemorySessionStore.java← ConcurrentHashMap + cleanup
+│       │   └── SessionData.java         ← Record: tokens + user info
+│       ├── keycloak/
+│       │   └── KeycloakClient.java      ← Token exchange, refresh, JWT parse
+│       └── util/
+│           ├── PkceUtil.java            ← code_verifier / code_challenge / SecureRandom ID
+│           └── CookieUtil.java          ← HttpOnly + SameSite=Strict cookies
 ├── frontend/                ← Обновлённый фронтенд (без keycloak-js)
-├── keycloak/                ← Конфигурация Keycloak (realm-export)
-├── ldap/                    ← Конфигурация OpenLDAP (config.ldif)
+│   ├── src/
+│   │   ├── App.tsx                      ← Убран ReactKeycloakProvider
+│   │   └── components/
+│   │       └── ReportPage.tsx           ← credentials: 'include' вместо Bearer token
+│   └── package.json                     ← Удалены keycloak-js, @react-keycloak/web
+├── keycloak/
+│   ├── realm-export.json                ← Исходный конфиг (не трогаем)
+│   └── keycloak-results-export.json     ← Наш результат (BFF + PKCE + LDAP + MFA + Яндекс)
+├── ldap/
+│   └── config.ldif                      ← Исправлен баг uid=alex → uid=alex.johnson
 ├── diagrams/                ← PlantUML-диаграммы
+│   ├── C4_BionicPRO_Target.puml / .png
+│   ├── Auth_Login_Flow.puml / .png
+│   ├── Auth_API_Request_Flow.puml / .png
+│   └── Auth_Logout_Flow.puml / .png
 ├── airflow/                 ← Задание 2: DAG для ETL
 ├── report-service/          ← Задание 2: API /reports (Java)
 ├── olap-db/                 ← ClickHouse: init-скрипты, витрины
@@ -94,7 +124,7 @@ architecture-bionicpro/
 | Компонент | Было | Стало |
 |-----------|------|-------|
 | Аутентификация | `keycloak-js` на фронте, токены в браузере | `bionicpro-auth` (BFF), токены на сервере |
-| Сессии | Нет серверных сессий | Redis / In-Memory (session_id → tokens) |
+| Сессии | Нет серверных сессий | In-Memory `ConcurrentHashMap` (session_id → tokens). В проде → Redis |
 | Identity | Keycloak standalone | Keycloak + LDAP (User Federation) + Яндекс ID (Brokering) |
 | MFA | Нет | TOTP (Google Authenticator / FreeOTP) |
 | Аналитика | PostgreSQL (перегружен) | ClickHouse (OLAP) + витрины |
@@ -103,55 +133,169 @@ architecture-bionicpro/
 
 Все оригинальные компоненты (Программа в чипе протеза, Приложение для донастройки, Интернет-магазин, CRM, cli tool) **сохранены** на диаграмме.
 
+---
+
 ### Задача 1.1 — Архитектурное решение
 
-→ См. `diagrams/C4_BionicPRO_Target.puml`
+→ `diagrams/C4_BionicPRO_Target.puml`
 
-### Задача 1.2 — PKCE
-
-Client `reports-frontend` в Keycloak переведён с `publicClient: true` на confidential + PKCE S256. `redirect_uri` указывает на BFF (`localhost:8000/auth/callback`), не на фронтенд.
-
-→ См. `diagrams/Auth_Login_Flow.puml` (шаги 4-19)
-
-### Задача 1.3 — Безопасное хранение токенов (bionicpro-auth)
-
-→ См. `bionicpro-auth/` — Java-сервис, реализующий:
-- Получение токенов от Keycloak (PKCE flow)
-- Хранение токенов в серверной сессии
-- HttpOnly cookie для фронтенда
-- Автоматический refresh access_token
-- Ротация session_id при каждом запросе
-- Проксирование запросов к API с Bearer Token
-
-→ См. `diagrams/Auth_API_Request_Flow.puml` (session rotation + token refresh)
-
-### Задача 1.4 — LDAP
-
-→ См. `ldap/config.ldif` — пользователи и роли для OpenLDAP  
-→ Keycloak User Federation настроен на `ldap://openldap:389`  
-→ Group-to-Role маппинг: LDAP группы → Keycloak realm roles
-
-### Задача 1.5 — MFA (OTP)
-
-→ Keycloak OTP Policy: TOTP, SHA1, 6 digits, 30 sec  
-→ Required Action: Configure OTP (обязателен для всех пользователей)  
-→ Browser Flow: OTP Form = Required
-
-### Задача 1.6 — Яндекс ID
-
-→ Keycloak Identity Provider: OpenID Connect → Яндекс ID  
-→ Authorization URL: `https://oauth.yandex.ru/authorize`  
-→ Consent screen + сохранение профиля
-
-### Проверка (deliverables задания 1)
-
-- [x] Диаграмма архитектуры (PlantUML вместо draw.io)
-- [ ] Код PKCE flow в `bionicpro-auth/`
-- [ ] Код BFF-сервиса (токены + сессии)
-- [ ] Обновлённый фронтенд (без `keycloak-js`)
-- [ ] `keycloak/keycloak-results-export.json`
-- [ ] OAuth 2.0 от Яндекс ID
+Целевая C4 Container Diagram включает все существующие компоненты + новые: `bionicpro-auth` (BFF), Session Store, ClickHouse, Airflow, Kafka/Debezium, Report Service, S3/MinIO, Nginx, OpenLDAP, Яндекс ID.
 
 ---
 
-*Задания 2-4 будут дополнены по мере выполнения.*
+### Задача 1.2 — PKCE
+
+→ `diagrams/Auth_Login_Flow.puml` (шаги 4–19)
+→ `bionicpro-auth/.../util/PkceUtil.java`
+→ `bionicpro-auth/.../handler/LoginHandler.java` + `CallbackHandler.java`
+
+Client `reports-frontend` в Keycloak переведён с `publicClient: true` на **confidential** + PKCE S256:
+
+```json
+{
+  "clientId": "reports-frontend",
+  "publicClient": false,
+  "secret": "bff-client-secret-change-me",
+  "redirectUris": ["http://localhost:8000/auth/callback"],
+  "directAccessGrantsEnabled": false,
+  "attributes": { "pkce.code.challenge.method": "S256" }
+}
+```
+
+`redirect_uri` указывает на BFF (`localhost:8000/auth/callback`), **не** на фронтенд.
+
+PKCE реализация (`PkceUtil.java`):
+- `code_verifier` — 32 байта `SecureRandom` → Base64URL (43 символа)
+- `code_challenge` — `BASE64URL(SHA-256(code_verifier))`
+- `state` — 32 байта `SecureRandom` → hex (64 символа), CSRF-защита
+
+Login flow: `LoginHandler` генерирует PKCE-пару, сохраняет `code_verifier` на сервере (привязанный к `state`), и редиректит пользователя на Keycloak с `code_challenge`. Callback: `CallbackHandler` обменивает `code + code_verifier + client_secret` на токены.
+
+---
+
+### Задача 1.3 — Безопасное хранение токенов (bionicpro-auth)
+
+→ `bionicpro-auth/` — полный исходный код Java-сервиса
+→ `diagrams/Auth_API_Request_Flow.puml` (session rotation + token refresh)
+
+**Стек:** Java 25, Javalin 6.4, Jackson, Logback. Maven. Без Spring.
+
+**Эндпоинты:**
+
+| Метод | Путь | Handler | Описание |
+|-------|------|---------|----------|
+| GET | `/auth/login` | `LoginHandler` | Генерирует PKCE, редиректит на Keycloak |
+| GET | `/auth/callback` | `CallbackHandler` | Обменивает code на токены, создаёт сессию, Set-Cookie |
+| POST | `/auth/logout` | `LogoutHandler` | Удаляет сессию, Keycloak SSO logout |
+| GET/POST | `/api/**` | `ProxyHandler` | Валидация + ротация + refresh + проксирование |
+| GET | `/health` | inline | `{"status":"UP","sessions":N}` |
+
+**Безопасность сессий:**
+- Session ID — `SecureRandom(32 bytes)` → hex (256 бит энтропии). Не UUID.
+- Cookie: `BIONIC_SESSION=<id>; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800`
+- Ротация: при каждом запросе `getAndRemove(oldId)` → обработка → `put(newId)`. Атомарно.
+- Refresh: `ProxyHandler` проверяет `accessTokenExpiresAt`, вызывает Keycloak `/token` с `grant_type=refresh_token`
+- Cleanup: фоновый поток каждые 5 минут удаляет истёкшие сессии
+
+**Хранилище:** `InMemorySessionStore` (`ConcurrentHashMap`) реализует интерфейс `SessionStore`. Замена на Redis — одна имплементация, остальной код не меняется.
+
+**Smoke-тест пройден:**
+
+```bash
+$ curl -s http://localhost:8000/health | jq .
+{"sessions":0,"status":"UP"}
+
+$ curl -v http://localhost:8000/auth/login 2>&1 | grep "Location"
+< Location: http://localhost:8080/realms/reports-realm/.../auth?...&code_challenge=...&code_challenge_method=S256
+
+$ curl -s http://localhost:8000/api/reports/me | jq .
+{"error":"Not authenticated. Please login."}
+```
+
+---
+
+### Задача 1.4 — LDAP
+
+→ `ldap/config.ldif`
+→ `keycloak/keycloak-results-export.json` (секция `components`)
+
+**Исправлен баг** в исходном `config.ldif`: DN записи Alex'а был `uid=alex`, а атрибут `uid` — `alex.johnson`. Группа `prothetic_user` ссылалась на `uid=alex.johnson` → member не находился. Исправлено: `uid=alex.johnson` и в DN, и в атрибуте.
+
+Добавлена группа `administrator` (отсутствовала в оригинале).
+
+Keycloak User Federation настроен на `ldap://openldap:389`:
+- Edit Mode: `READ_ONLY`
+- Group-to-Role маппинг: LDAP-группы (`cn=prothetic_user,ou=Groups,...`) → Keycloak realm roles
+- Attribute mappers: `uid→username`, `mail→email`, `cn→firstName`, `sn→lastName`
+
+---
+
+### Задача 1.5 — MFA (OTP)
+
+→ `keycloak/keycloak-results-export.json` (секции `otpPolicy*`, `requiredActions`, `users[].requiredActions`)
+
+Настройка:
+- OTP Policy: TOTP, HmacSHA1, 6 digits, 30 sec, Look Ahead Window = 1
+- Required Action `CONFIGURE_TOTP` включён как Default Action
+- У всех пользователей в `requiredActions` добавлен `CONFIGURE_TOTP`
+- При первом логине Keycloak покажет QR-код для Google Authenticator / FreeOTP
+
+---
+
+### Задача 1.6 — Яндекс ID
+
+→ `keycloak/keycloak-results-export.json` (секция `identityProviders`)
+
+Identity Provider настроен как OpenID Connect:
+- Authorization URL: `https://oauth.yandex.ru/authorize`
+- Token URL: `https://oauth.yandex.ru/token`
+- UserInfo URL: `https://login.yandex.ru/info`
+- Scope: `login:email login:info`
+- `clientId` / `clientSecret` — плейсхолдеры (`YANDEX_CLIENT_ID_PLACEHOLDER`). Для активации необходимо зарегистрировать приложение на https://oauth.yandex.ru/ и подставить реальные значения.
+
+---
+
+### Изменения во фронтенде
+
+Из `package.json` удалены зависимости:
+- `keycloak-js` (^21.1.0)
+- `@react-keycloak/web` (^3.4.0)
+
+`App.tsx` — убран `ReactKeycloakProvider`, чистый рендер без знания о Keycloak.
+
+`ReportPage.tsx` — полностью переписан:
+
+| Аспект | Было (keycloak-js) | Стало (BFF) |
+|--------|---------------------|-------------|
+| Логин | `keycloak.login()` | `window.location.href = '/auth/login'` |
+| Токен | `keycloak.token` в `Authorization` header | `credentials: 'include'` (cookie автоматически) |
+| Логаут | `keycloak.logout()` | `POST /auth/logout` (form submit) |
+| Знание о Keycloak | Да (URL, realm, clientId) | Нет. Фронтенд знает только BFF URL |
+
+---
+
+### Изменения в docker-compose.yaml
+
+- Добавлен сервис `bionicpro-auth` (build из `./bionicpro-auth`, порт 8000)
+- Keycloak импортирует `keycloak-results-export.json` (вместо `realm-export.json`)
+- Frontend: env vars `REACT_APP_KEYCLOAK_*` заменены на `REACT_APP_BFF_URL`
+
+---
+
+### Deliverables задания 1
+
+- [x] C4 Container Diagram целевой архитектуры (`diagrams/C4_BionicPRO_Target.puml`)
+- [x] Sequence Diagram: Login Flow с PKCE + MFA (`diagrams/Auth_Login_Flow.puml`)
+- [x] Sequence Diagram: API Request с ротацией и refresh (`diagrams/Auth_API_Request_Flow.puml`)
+- [x] Sequence Diagram: Logout Flow (`diagrams/Auth_Logout_Flow.puml`)
+- [x] Код PKCE flow (`bionicpro-auth/.../PkceUtil.java`, `LoginHandler.java`, `CallbackHandler.java`)
+- [x] Код BFF-сервиса: токены на сервере, HttpOnly cookie, ротация, refresh (`bionicpro-auth/`)
+- [x] Обновлённый фронтенд без `keycloak-js` (`frontend/`)
+- [x] Keycloak realm config: confidential client + PKCE + LDAP + MFA + Яндекс ID (`keycloak/keycloak-results-export.json`)
+- [x] LDAP config с исправленным багом (`ldap/config.ldif`)
+- [x] Обновлённый `docker-compose.yaml`
+- [ ] Интеграционный тест: полный auth flow (Keycloak + BFF + Frontend). Требует `docker-compose up` и регистрации приложения в Яндекс ID.
+
+---
+
+*Задания 2–4 будут дополнены по мере выполнения.*
