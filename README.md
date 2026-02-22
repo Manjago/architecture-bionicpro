@@ -9,7 +9,7 @@
 | # | Задание | Суть | Статус |
 |---|---------|------|--------|
 | 1 | Повышение безопасности | BFF + PKCE + LDAP + MFA + Яндекс ID | ✅ Готово |
-| 2 | Сервис отчётов | Airflow ETL → ClickHouse → Report API | ⏳ |
+| 2 | Сервис отчётов | Airflow ETL → ClickHouse → Report API | ✅ Готово |
 | 3 | Снижение нагрузки на БД | S3 + CDN (Nginx) кэширование отчётов | ⏳ |
 | 4 | Оперативность CRM | CDC через Debezium → Kafka → ClickHouse | ⏳ |
 
@@ -36,11 +36,33 @@ architecture-bionicpro/
 │       └── util/
 │           ├── PkceUtil.java            ← code_verifier / code_challenge / SecureRandom ID
 │           └── CookieUtil.java          ← HttpOnly + SameSite=Strict cookies
+├── report-service/          ← Задание 2: Report API (Java 25, Javalin)
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/bionicpro/reports/
+│       ├── ReportServer.java            ← Точка входа, порт 8001, конфиг из env
+│       ├── handler/
+│       │   ├── ReportHandler.java       ← GET /reports/me + /reports/{userId}
+│       │   └── HealthHandler.java       ← GET /health
+│       ├── clickhouse/
+│       │   └── ClickHouseClient.java    ← HTTP-запросы к ClickHouse (java.net.http)
+│       └── auth/
+│           └── JwtUtil.java             ← Base64-декодер JWT payload
+├── airflow/                 ← Задание 2: ETL-оркестрация
+│   └── dags/
+│       └── etl_reports.py               ← DAG: CRM + телеметрия → витрина ClickHouse
+├── olap-db/                 ← ClickHouse: init-скрипты, данные
+│   ├── init.sql                         ← emg_sensor_data + user_reports (витрина)
+│   ├── olap.csv                         ← Тестовые данные телеметрии (5000 записей)
+│   └── users.xml                        ← Конфиг доступа (без пароля, dev)
+├── crm-db/                  ← CRM: init-скрипт, данные
+│   ├── init.sql                         ← Таблица customers
+│   └── crm.csv                          ← Тестовые данные клиентов (1000 записей)
 ├── frontend/                ← Обновлённый фронтенд (без keycloak-js)
 │   ├── src/
 │   │   ├── App.tsx                      ← Убран ReactKeycloakProvider
 │   │   └── components/
-│   │       └── ReportPage.tsx           ← credentials: 'include' вместо Bearer token
+│   │       └── ReportPage.tsx           ← Кнопка «Получить отчёт», отображение данных
 │   └── package.json                     ← Удалены keycloak-js, @react-keycloak/web
 ├── keycloak/
 │   ├── realm-export.json                ← Исходный конфиг (не трогаем)
@@ -51,11 +73,9 @@ architecture-bionicpro/
 │   ├── C4_BionicPRO_Target.puml / .png
 │   ├── Auth_Login_Flow.puml / .png
 │   ├── Auth_API_Request_Flow.puml / .png
-│   └── Auth_Logout_Flow.puml / .png
-├── airflow/                 ← Задание 2: DAG для ETL
-├── report-service/          ← Задание 2: API /reports (Java)
-├── olap-db/                 ← ClickHouse: init-скрипты, витрины
-├── crm-db/                  ← CRM: init-скрипт + данные (CSV)
+│   ├── Auth_Logout_Flow.puml / .png
+│   ├── ETL_Reports_Architecture.puml / .png
+│   └── Report_Request_Flow.puml / .png
 ├── nginx/                   ← Задание 3: Nginx reverse proxy + cache
 ├── debezium/                ← Задание 4: CDC connector config
 ├── docker-compose.yaml      ← Полная конфигурация развёртывания
@@ -298,4 +318,223 @@ Identity Provider настроен как OpenID Connect:
 
 ---
 
-*Задания 2–4 будут дополнены по мере выполнения.*
+## Задание 2. Разработка сервиса отчётов
+
+### Проблема
+
+Пользователи хотят получать данные о работе своих протезов в виде отчёта. Данные разбросаны по двум источникам: телеметрия с датчиков (ClickHouse) и информация о клиентах (CRM PostgreSQL). Нужен ETL-процесс для объединения данных и API для выдачи отчётов.
+
+### Решение: Airflow ETL → ClickHouse витрина → Report Service API
+
+Два потока данных:
+
+**ETL (batch, @daily):**
+```
+CRM PostgreSQL ──┐
+                 ├──→ Airflow DAG ──→ ClickHouse (витрина user_reports)
+ClickHouse       ┘
+(emg_sensor_data)
+```
+
+**Runtime (по запросу пользователя):**
+```
+Frontend → BFF (cookie → Bearer) → Report Service → ClickHouse витрина → JSON
+```
+
+### Диаграммы
+
+#### ETL Reports Architecture (C4 Container Diagram)
+
+Архитектура сервиса отчётов: источники данных, ETL через Airflow, витрина ClickHouse, Report Service API.
+
+[Исходник PlantUML](diagrams/ETL_Reports_Architecture.puml)
+
+![ETL Reports Architecture](diagrams/ETL_Reports_Architecture.png)
+
+#### Report Request Flow (Sequence Diagram)
+
+Полный поток запроса отчёта: от клика пользователя через BFF и Report Service до ClickHouse. Включает ETL-процесс Airflow.
+
+[Исходник PlantUML](diagrams/Report_Request_Flow.puml)
+
+![Report Request Flow](diagrams/Report_Request_Flow.png)
+
+---
+
+### Задача 2.1 — Архитектура решения
+
+→ `diagrams/ETL_Reports_Architecture.puml`
+→ `diagrams/Report_Request_Flow.puml`
+
+Архитектура включает:
+- **Источники:** CRM DB (PostgreSQL, клиенты) + ClickHouse (сырая телеметрия `emg_sensor_data`)
+- **ETL:** Apache Airflow, DAG `etl_reports`, расписание `@daily`
+- **Витрина:** таблица `user_reports` в ClickHouse (агрегаты по пользователям и типам протезов)
+- **API:** Report Service (Java 25, Javalin) — `GET /reports/me`, `GET /reports/{userId}`
+- **Авторизация:** BFF проксирует запросы с Bearer token, Report Service проверяет JWT sub == userId
+
+Ключевое решение: Airflow не перекладывает данные через Python. Вместо этого ClickHouse сам читает из CRM PostgreSQL через табличную функцию `postgresql()`. Данные не проходят через промежуточные слои.
+
+---
+
+### Задача 2.2 — Airflow DAG
+
+→ `airflow/dags/etl_reports.py`
+
+**DAG `etl_reports`** — четыре задачи, линейная цепочка:
+
+```
+check_sources → truncate_view → build_report_view → verify_view
+```
+
+| Задача | Что делает |
+|--------|-----------|
+| `check_sources` | Проверяет доступность CRM и ClickHouse, считает строки |
+| `truncate_view` | Очищает витрину (full refresh) |
+| `build_report_view` | `INSERT INTO user_reports SELECT ... FROM emg_sensor_data JOIN postgresql(crm)` |
+| `verify_view` | Проверяет, что витрина не пуста, логирует статистику |
+
+**Конфигурация:**
+- `schedule_interval='@daily'` — ежедневно в полночь UTC
+- `catchup=False` — не запускать за прошлые даты
+- `retries=2`, `retry_delay=5 мин`
+- Зависимости Python: `clickhouse-driver`, `psycopg2-binary` (через `_PIP_ADDITIONAL_REQUIREMENTS`)
+
+**Стратегия загрузки:** Full refresh (truncate + insert). Для учебного объёма данных это проще и надёжнее инкрементальной загрузки.
+
+---
+
+### Задача 2.2 — ClickHouse: схема данных
+
+→ `olap-db/init.sql`
+
+Две таблицы:
+
+**`emg_sensor_data`** — сырая телеметрия:
+```sql
+CREATE TABLE emg_sensor_data (
+    user_id UInt32, prosthesis_type String, muscle_group String,
+    signal_frequency UInt32, signal_duration UInt32,
+    signal_amplitude Decimal(5,2), signal_time DateTime
+) ENGINE = MergeTree()
+ORDER BY (user_id, prosthesis_type, signal_time);
+```
+
+**`user_reports`** — витрина (заполняется Airflow):
+```sql
+CREATE TABLE user_reports (
+    user_id UInt32, customer_name String, customer_email String,
+    prosthesis_type String, total_signals UInt64,
+    avg_amplitude Float64, avg_frequency Float64, avg_duration Float64,
+    min_signal_time DateTime, max_signal_time DateTime,
+    report_updated DateTime DEFAULT now()
+) ENGINE = MergeTree()
+ORDER BY (user_id, prosthesis_type);
+```
+
+`ORDER BY` начинается с `user_id` — основной фильтр при запросе отчёта. Используется обычный `MergeTree` (не `SummingMergeTree`), потому что витрина содержит `avg`-агрегаты.
+
+**Тестовые данные:**
+- `olap.csv` — 5000 записей телеметрии, 995 уникальных user_id, период февраль–март 2025
+- `crm.csv` — 1000 клиентов, id 1–1000
+
+---
+
+### Задача 2.3 — Report Service (API)
+
+→ `report-service/` — полный исходный код Java-сервиса
+
+**Стек:** Java 25, Javalin 6.4, Jackson, Logback. Maven. Без Spring. Идентичный стек с `bionicpro-auth`.
+
+**Эндпоинты:**
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/reports/me` | Отчёт по текущему пользователю (userId из JWT sub) |
+| GET | `/reports/{userId}` | Отчёт по конкретному userId (проверка: sub == userId) |
+| GET | `/health` | `{"status":"UP","clickhouse":"connected"}` |
+
+**ClickHouse-клиент:** Использует HTTP API (порт 8123) через встроенный `java.net.http.HttpClient`. Ноль дополнительных зависимостей сверх Javalin + Jackson.
+
+**JWT:** `JwtUtil` декодирует payload из Base64 без криптографической верификации подписи. Это безопасно: Report Service доступен только из docker-сети, запросы приходят от BFF.
+
+**Формат ответа:**
+```json
+{
+  "userId": 512,
+  "customerName": "Alexis Moore",
+  "customerEmail": "alexis.moore@example.com",
+  "reportUpdated": "2025-03-16 02:00:00",
+  "prostheses": [
+    {
+      "prosthesisType": "arm",
+      "totalSignals": 42,
+      "avgAmplitude": 3.14,
+      "avgFrequency": 256,
+      "avgDuration": 2100,
+      "minSignalTime": "2025-02-01 ...",
+      "maxSignalTime": "2025-03-31 ..."
+    }
+  ]
+}
+```
+
+---
+
+### Задача 2.4 — Ограничение доступа
+
+→ `report-service/.../handler/ReportHandler.java`
+
+Реализовано в `ReportHandler`:
+1. Извлечь JWT из `Authorization: Bearer ...`
+2. Декодировать payload, взять claim `sub` (user_id)
+3. Для `/reports/{userId}`: сравнить `sub` с `{userId}` — если не совпадает, вернуть `403 Forbidden`
+4. Для `/reports/me`: userId берётся напрямую из JWT, проверка не нужна
+
+BFF (`ProxyHandler`) подставляет `Authorization: Bearer <access_token>` при проксировании.
+
+---
+
+### Задача 2.5 — UI: кнопка получения отчёта
+
+→ `frontend/src/components/ReportPage.tsx`
+
+Обновлённый `ReportPage.tsx`:
+- Кнопка «Получить отчёт» → `fetch('/api/reports/me', { credentials: 'include' })`
+- Отображение: имя клиента, email, группировка по типам протезов, метрики (сигналы, амплитуда, частота, длительность, период)
+- Состояния UI: загрузка, успех, «отчёт не найден» (ETL ещё не обработал), ошибка авторизации (кнопка «Войти»)
+- Кнопка «Выйти» → `POST /auth/logout`
+
+---
+
+### Изменения в docker-compose.yaml (задание 2)
+
+Добавлены сервисы:
+
+| Сервис | Образ | Порт | Назначение |
+|--------|-------|------|-----------|
+| `report-service` | build `./report-service` | 8001 | API /reports |
+| `airflow_db` | postgres:14 | 5435 | Метабаза Airflow |
+| `airflow-init` | apache/airflow:2.8.1 | — | Инициализация БД + admin |
+| `airflow-webserver` | apache/airflow:2.8.1 | 8085 | UI (8080 занят Keycloak) |
+| `airflow-scheduler` | apache/airflow:2.8.1 | — | Парсинг DAG, запуск задач |
+
+BFF `API_BASE_URL` обновлён на `http://report-service:8001`.
+
+---
+
+### Deliverables задания 2
+
+- [x] Архитектура решения: C4 диаграмма (`diagrams/ETL_Reports_Architecture.puml`)
+- [x] Sequence Diagram: Report Request Flow (`diagrams/Report_Request_Flow.puml`)
+- [x] ClickHouse init-скрипты: сырые данные + витрина (`olap-db/init.sql`)
+- [x] CRM init-скрипт + тестовые данные (`crm-db/init.sql`, `crm-db/crm.csv`)
+- [x] Airflow DAG: ETL с расписанием (`airflow/dags/etl_reports.py`)
+- [x] Report Service: API /reports с авторизацией (`report-service/`)
+- [x] Обновлённый фронтенд: кнопка «Получить отчёт» (`frontend/.../ReportPage.tsx`)
+- [x] Обновлённый `docker-compose.yaml` (report-service + Airflow)
+- [ ] Интеграционный тест: полный поток (Airflow ETL → отчёт в UI). Требует `docker-compose up`.
+
+---
+
+*Задания 3–4 будут дополнены по мере выполнения.*
