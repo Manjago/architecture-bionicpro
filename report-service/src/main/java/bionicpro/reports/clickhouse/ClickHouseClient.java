@@ -19,20 +19,42 @@ import java.util.Map;
  * Использует HTTP-интерфейс ClickHouse (порт 8123) и встроенный
  * {@link java.net.http.HttpClient} — никаких дополнительных зависимостей.
  * Запросы возвращаются в формате JSON.
+ * <p>
+ * Витрина для отчётов задаётся через параметр {@code reportView}:
+ * <ul>
+ *   <li>{@code user_reports} — batch-витрина из Airflow ETL (задание 2)</li>
+ *   <li>{@code user_reports_cdc} — CDC-витрина из Debezium pipeline (задание 4)</li>
+ * </ul>
  */
 public class ClickHouseClient {
 
     private static final Logger log = LoggerFactory.getLogger(ClickHouseClient.class);
     private static final ObjectMapper mapper = new ObjectMapper();
 
+    /** Витрина по умолчанию — batch ETL из задания 2. */
+    private static final String DEFAULT_REPORT_VIEW = "user_reports";
+
     private final String baseUrl;
+    private final String reportView;
     private final HttpClient http;
 
     public ClickHouseClient(String host, int port) {
+        this(host, port, DEFAULT_REPORT_VIEW);
+    }
+
+    /**
+     * @param host       hostname ClickHouse (e.g. "olap_db")
+     * @param port       HTTP-порт (e.g. 8123)
+     * @param reportView имя витрины: "user_reports" или "user_reports_cdc"
+     */
+    public ClickHouseClient(String host, int port, String reportView) {
         this.baseUrl = "http://" + host + ":" + port;
+        this.reportView = (reportView != null && !reportView.isBlank())
+                ? reportView : DEFAULT_REPORT_VIEW;
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
+        log.info("ClickHouseClient initialized: url={}, reportView={}", baseUrl, this.reportView);
     }
 
     /**
@@ -54,9 +76,13 @@ public class ClickHouseClient {
     }
 
     /**
-     * Запрашивает отчёт по userId из витрины user_reports.
+     * Запрашивает отчёт по userId из витрины (batch или CDC).
      * <p>
-     * Возвращает список строк (по одной на каждый prosthesis_type).
+     * Обе витрины возвращают одинаковую структуру колонок:
+     * user_id, customer_name, customer_email, prosthesis_type,
+     * total_signals, avg_amplitude, avg_frequency, avg_duration,
+     * min_signal_time, max_signal_time, report_updated.
+     * <p>
      * Параметр userId передаётся безопасно — через числовой каст,
      * SQL-инъекция невозможна (int, не строка).
      *
@@ -77,11 +103,11 @@ public class ClickHouseClient {
                     toString(min_signal_time) AS min_signal_time,
                     toString(max_signal_time) AS max_signal_time,
                     toString(report_updated)  AS report_updated
-                FROM user_reports
+                FROM %s
                 WHERE user_id = %d
                 ORDER BY prosthesis_type
                 FORMAT JSON
-                """.formatted(userId);
+                """.formatted(reportView, userId);
 
         String responseBody = executeQuery(sql);
 
@@ -97,6 +123,11 @@ public class ClickHouseClient {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> rows = (List<Map<String, Object>>) data;
         return rows;
+    }
+
+    /** Возвращает имя используемой витрины (для /health endpoint). */
+    public String getReportView() {
+        return reportView;
     }
 
     // ── Internal ───────────────────────────────────────────────────────

@@ -34,7 +34,8 @@ public class ReportServer {
         String cdnBaseUrl = env("CDN_BASE_URL", "/cdn");
 
         // ── Clients ────────────────────────────────────────────────────
-        var ch = new ClickHouseClient(chHost, chPort);
+        String reportView = System.getenv().getOrDefault("REPORT_VIEW", "user_reports");        
+        var ch = new ClickHouseClient(chHost, chPort, reportView);
         var s3 = new S3ReportStore(minioEndpoint, minioAccessKey, minioSecretKey, cdnBaseUrl);
 
         // ── Handlers ───────────────────────────────────────────────────
