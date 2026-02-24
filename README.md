@@ -10,7 +10,7 @@
 |---|---------|------|--------|
 | 1 | Повышение безопасности | BFF + PKCE + LDAP + MFA + Яндекс ID | ✅ Готово |
 | 2 | Сервис отчётов | Airflow ETL → ClickHouse → Report API | ✅ Готово |
-| 3 | Снижение нагрузки на БД | S3 + CDN (Nginx) кэширование отчётов | ⏳ |
+| 3 | Снижение нагрузки на БД | S3 + CDN (Nginx) кэширование отчётов | ✅ Готово |
 | 4 | Оперативность CRM | CDC через Debezium → Kafka → ClickHouse | ⏳ |
 
 ## Структура репозитория
@@ -36,16 +36,18 @@ architecture-bionicpro/
 │       └── util/
 │           ├── PkceUtil.java            ← code_verifier / code_challenge / SecureRandom ID
 │           └── CookieUtil.java          ← HttpOnly + SameSite=Strict cookies
-├── report-service/          ← Задание 2: Report API (Java 25, Javalin)
+├── report-service/          ← Задание 2+3: Report API + S3 кэш (Java 25, Javalin)
 │   ├── pom.xml
 │   ├── Dockerfile
 │   └── src/main/java/bionicpro/reports/
 │       ├── ReportServer.java            ← Точка входа, порт 8001, конфиг из env
 │       ├── handler/
-│       │   ├── ReportHandler.java       ← GET /reports/me + /reports/{userId}
-│       │   └── HealthHandler.java       ← GET /health
+│       │   ├── ReportHandler.java       ← GET /reports/me + /reports/{userId} + S3 кэш
+│       │   └── HealthHandler.java       ← GET /health (CH + S3 статус)
 │       ├── clickhouse/
 │       │   └── ClickHouseClient.java    ← HTTP-запросы к ClickHouse (java.net.http)
+│       ├── s3/
+│       │   └── S3ReportStore.java       ← MinIO: check/get/put отчётов, CDN URL
 │       └── auth/
 │           └── JwtUtil.java             ← Base64-декодер JWT payload
 ├── airflow/                 ← Задание 2: ETL-оркестрация
@@ -75,8 +77,10 @@ architecture-bionicpro/
 │   ├── Auth_API_Request_Flow.puml / .png
 │   ├── Auth_Logout_Flow.puml / .png
 │   ├── ETL_Reports_Architecture.puml / .png
-│   └── Report_Request_Flow.puml / .png
-├── nginx/                   ← Задание 3: Nginx reverse proxy + cache
+│   ├── Report_Request_Flow.puml / .png
+│   └── S3_CDN_Cache_Flow.puml / .png
+├── nginx/                   ← Задание 3: CDN — Nginx reverse proxy + cache
+│   └── nginx.conf                       ← proxy_cache → MinIO, TTL 24h, X-Cache-Status
 ├── debezium/                ← Задание 4: CDC connector config
 ├── docker-compose.yaml      ← Полная конфигурация развёртывания
 └── README.md                ← Этот файл
@@ -537,4 +541,161 @@ BFF `API_BASE_URL` обновлён на `http://report-service:8001`.
 
 ---
 
-*Задания 3–4 будут дополнены по мере выполнения.*
+## Задание 3. Снижение нагрузки на базу данных
+
+### Проблема
+
+После внедрения сервиса отчётов (задание 2) нагрузка на ClickHouse возросла. Пользователи часто запрашивают свои отчёты, но данные обновляются только раз в сутки (ETL @daily). Каждый запрос одного и того же отчёта генерирует повторный `SELECT` к OLAP-базе — впустую.
+
+### Решение: S3 + CDN (Nginx)
+
+Два уровня кэширования:
+
+1. **S3 (MinIO)** — Report Service сохраняет сгенерированный отчёт как JSON-объект в MinIO. При повторном запросе — читает из S3 вместо ClickHouse.
+2. **CDN (Nginx)** — Nginx проксирует запросы к MinIO с кэшированием на диске. Клиент получает отчёт из кэша Nginx, даже MinIO не затрагивается.
+
+```
+Первый запрос:   Frontend → BFF → Report Service → ClickHouse → S3 (PUT) → ответ
+Повторный:       Frontend → BFF → Report Service → S3 (GET) → ответ  (ClickHouse не тронут)
+CDN-запрос:      Frontend → Nginx → кэш (HIT) → ответ                (S3 не тронут)
+```
+
+### Диаграмма
+
+#### S3 + CDN Cache Flow (Sequence Diagram)
+
+Три сценария: первый запрос (генерация), повторный (S3), CDN-кэш (Nginx). Плюс инвалидация кэша через Airflow.
+
+[Исходник PlantUML](diagrams/S3_CDN_Cache_Flow.puml)
+
+![S3 CDN Cache Flow](diagrams/S3_CDN_Cache_Flow.png)
+
+---
+
+### Задача 3.1 — Запись отчётов в S3
+
+→ `report-service/.../s3/S3ReportStore.java`
+→ `report-service/.../handler/ReportHandler.java`
+
+**S3ReportStore** — клиент для MinIO (библиотека `io.minio:minio:8.5.7`):
+
+| Метод | Что делает | S3 операция |
+|-------|-----------|-------------|
+| `exists(userId)` | Проверяет наличие отчёта | `HEAD /reports/{userId}/report.json` |
+| `get(userId)` | Читает отчёт | `GET /reports/{userId}/report.json` |
+| `put(userId, json)` | Сохраняет отчёт | `PUT /reports/{userId}/report.json` |
+| `cdnUrl(userId)` | Формирует CDN-ссылку | `/cdn/reports/{userId}/report.json` |
+
+При старте сервиса `S3ReportStore` автоматически:
+- Создаёт bucket `reports` (если не существует)
+- Устанавливает anonymous read policy — чтобы Nginx мог проксировать GET без авторизации
+
+**Обновлённый ReportHandler** — flow:
+1. Извлечь userId из JWT (как в задании 2)
+2. `s3.exists(userId)` → если есть → `s3.get(userId)` → вернуть с `cdnUrl`
+3. Если нет → запросить ClickHouse → `s3.put(userId, json)` → вернуть с `cdnUrl`
+4. В ответе: поле `"source": "s3"` или `"clickhouse"` — для отладки
+
+S3 — кэширующий слой. Его недоступность не ломает основной flow: если MinIO недоступен, отчёт генерируется из ClickHouse напрямую (graceful degradation).
+
+**Структура ключей в S3:**
+```
+reports/               ← bucket
+├── 512/
+│   └── report.json
+├── 887/
+│   └── report.json
+└── ...
+```
+
+---
+
+### Задача 3.2 — CDN (Nginx reverse proxy + cache)
+
+→ `nginx/nginx.conf`
+
+Nginx эмулирует CDN: проксирует `GET /cdn/reports/...` к MinIO и кэширует ответы на диске.
+
+```nginx
+proxy_cache_path /var/cache/nginx/s3
+    levels=1:2 keys_zone=s3_cache:10m max_size=1g inactive=24h;
+
+location /cdn/reports/ {
+    rewrite ^/cdn/(.*)$ /$1 break;
+    proxy_pass http://minio:9000;
+    proxy_cache s3_cache;
+    proxy_cache_valid 200 24h;
+    proxy_cache_valid 404 1m;
+    add_header X-Cache-Status $upstream_cache_status always;
+}
+```
+
+| Параметр | Значение | Почему |
+|----------|---------|--------|
+| `proxy_cache_valid 200 24h` | TTL кэша для успешных ответов | Совпадает с периодом ETL |
+| `proxy_cache_valid 404 1m` | TTL для 404 | Отчёт может появиться после генерации |
+| `proxy_cache_key $uri` | Ключ кэша | Один URL = один кэш |
+| `X-Cache-Status` | HIT / MISS / EXPIRED | Заголовок для отладки |
+| `Authorization ""` | Убираем заголовок авторизации | Bucket с anonymous read |
+
+Nginx на порту **8088** (наружу).
+
+---
+
+### Задача 3.3 — Механизм обновления кэша
+
+→ `airflow/dags/etl_reports.py` (шаг `invalidate_s3_cache`)
+
+Двухуровневая инвалидация:
+
+**Уровень 1: S3 (активная очистка через Airflow).** После перестроения витрины Airflow DAG удаляет все объекты из bucket `reports`. При следующем запросе пользователя Report Service не найдёт отчёт в S3, сгенерирует свежий из обновлённой витрины и сохранит обратно.
+
+Обновлённая цепочка задач:
+```
+check_sources → truncate_view → build_report_view → verify_view → invalidate_s3_cache
+```
+
+**Уровень 2: Nginx (TTL-based).** Кэш Nginx живёт 24 часа (`proxy_cache_valid 200 24h`). После удаления объектов из S3 Airflow'ом, Nginx при следующем запросе получит MISS → обратится к MinIO → получит 404 или свежий отчёт. Модуль `ngx_cache_purge` не требуется.
+
+**Цепочка инвалидации:**
+```
+Airflow обновляет витрину
+  → Airflow удаляет объекты из S3
+    → Nginx кэш устаревает по TTL
+      → Следующий запрос: Report Service → ClickHouse → свежий отчёт → S3 → Nginx
+```
+
+---
+
+### Изменения в docker-compose.yaml (задание 3)
+
+Добавлен сервис:
+
+| Сервис | Образ | Порт | Назначение |
+|--------|-------|------|-----------|
+| `nginx` | nginx:1.25-alpine | 8088 | CDN — reverse proxy к MinIO с кэшированием |
+
+Обновлённые сервисы:
+
+| Сервис | Что изменилось |
+|--------|---------------|
+| `report-service` | Добавлены env: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `CDN_BASE_URL`. depends_on: minio |
+| `airflow-*` | `_PIP_ADDITIONAL_REQUIREMENTS` — добавлен пакет `minio` |
+
+Volumes: добавлен `nginx_cache` для персистентного кэша Nginx.
+
+---
+
+### Deliverables задания 3
+
+- [x] Sequence Diagram: S3 + CDN кэширование (`diagrams/S3_CDN_Cache_Flow.puml`)
+- [x] Report Service: запись отчётов в S3, check→get/generate→put (`report-service/.../s3/S3ReportStore.java`)
+- [x] Report Service: при запросе сначала S3, потом ClickHouse (`report-service/.../handler/ReportHandler.java`)
+- [x] Nginx конфигурация: reverse proxy + cache (`nginx/nginx.conf`)
+- [x] Airflow DAG: инвалидация S3 кэша после ETL (`airflow/dags/etl_reports.py`)
+- [x] Обновлённый `docker-compose.yaml` (nginx + S3 env vars)
+- [ ] Интеграционный тест: X-Cache-Status HIT/MISS. Требует `docker-compose up`.
+
+---
+
+*Задание 4 будет дополнено по мере выполнения.*
