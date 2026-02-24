@@ -1,33 +1,34 @@
 package bionicpro.reports.handler;
 
 import bionicpro.reports.clickhouse.ClickHouseClient;
+import bionicpro.reports.s3.S3ReportStore;
 import io.javalin.http.Context;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * GET /health
- * <p>
- * Проверяет доступность ClickHouse и возвращает статус.
+ * GET /health — проверяет доступность ClickHouse и MinIO (S3).
  */
 public class HealthHandler {
 
     private final ClickHouseClient ch;
+    private final S3ReportStore s3;
 
-    public HealthHandler(ClickHouseClient ch) {
+    public HealthHandler(ClickHouseClient ch, S3ReportStore s3) {
         this.ch = ch;
+        this.s3 = s3;
     }
 
     public void check(Context ctx) {
-        try {
-            boolean chOk = ch.ping();
-            if (chOk) {
-                ctx.json(Map.of("status", "UP", "clickhouse", "connected"));
-            } else {
-                ctx.status(503).json(Map.of("status", "DOWN", "clickhouse", "unreachable"));
-            }
-        } catch (Exception e) {
-            ctx.status(503).json(Map.of("status", "DOWN", "error", e.getMessage()));
-        }
+        boolean chOk = ch.ping();
+        boolean s3Ok = s3.ping();
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("status", chOk && s3Ok ? "UP" : "DEGRADED");
+        body.put("clickhouse", chOk ? "connected" : "unreachable");
+        body.put("s3", s3Ok ? "connected" : "unreachable");
+
+        ctx.status(chOk ? 200 : 503).json(body);
     }
 }

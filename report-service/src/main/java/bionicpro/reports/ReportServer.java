@@ -3,6 +3,7 @@ package bionicpro.reports;
 import bionicpro.reports.clickhouse.ClickHouseClient;
 import bionicpro.reports.handler.HealthHandler;
 import bionicpro.reports.handler.ReportHandler;
+import bionicpro.reports.s3.S3ReportStore;
 import io.javalin.Javalin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,9 +11,9 @@ import org.slf4j.LoggerFactory;
 /**
  * BionicPRO Report Service.
  * <p>
- * API для получения пользовательских отчётов из ClickHouse.
+ * API для получения пользовательских отчётов.
+ * Поток: проверка S3 → (если нет) генерация из ClickHouse → сохранение в S3 → ответ с CDN URL.
  * Авторизация: JWT из Authorization header (проксируется через BFF).
- * Пользователь может запрашивать только свой отчёт.
  */
 public class ReportServer {
 
@@ -21,15 +22,24 @@ public class ReportServer {
     public static void main(String[] args) {
         // ── Config from env ────────────────────────────────────────────
         int port = intEnv("PORT", 8001);
+
+        // ClickHouse
         String chHost = env("CLICKHOUSE_HOST", "olap_db");
         int chPort = intEnv("CLICKHOUSE_PORT", 8123);
 
-        // ── ClickHouse client ──────────────────────────────────────────
+        // MinIO (S3)
+        String minioEndpoint = env("MINIO_ENDPOINT", "http://minio:9000");
+        String minioAccessKey = env("MINIO_ACCESS_KEY", "minio_user");
+        String minioSecretKey = env("MINIO_SECRET_KEY", "minio_password");
+        String cdnBaseUrl = env("CDN_BASE_URL", "/cdn");
+
+        // ── Clients ────────────────────────────────────────────────────
         var ch = new ClickHouseClient(chHost, chPort);
+        var s3 = new S3ReportStore(minioEndpoint, minioAccessKey, minioSecretKey, cdnBaseUrl);
 
         // ── Handlers ───────────────────────────────────────────────────
-        var reportHandler = new ReportHandler(ch);
-        var healthHandler = new HealthHandler(ch);
+        var reportHandler = new ReportHandler(ch, s3);
+        var healthHandler = new HealthHandler(ch, s3);
 
         // ── Server ─────────────────────────────────────────────────────
         var app = Javalin.create(config -> {
@@ -41,8 +51,8 @@ public class ReportServer {
         app.get("/health", healthHandler::check);
 
         app.start(port);
-        log.info("Report Service started on port {}, ClickHouse={}:{}",
-                port, chHost, chPort);
+        log.info("Report Service started on port {}, ClickHouse={}:{}, MinIO={}",
+                port, chHost, chPort, minioEndpoint);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────

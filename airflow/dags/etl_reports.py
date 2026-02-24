@@ -9,6 +9,7 @@ ETL-процесс для построения витрины отчётов в 
   3. Строим витрину: ClickHouse читает телеметрию (emg_sensor_data)
      и делает JOIN с CRM через табличную функцию postgresql()
   4. Верифицируем результат (витрина не пустая)
+  5. Очищаем кэш отчётов в S3 (задание 3: инвалидация после обновления витрины)
 
 Расписание: @daily (каждую ночь в 00:00 UTC)
 """
@@ -29,6 +30,11 @@ CRM_PORT = 5432
 CRM_DB = 'crm_db'
 CRM_USER = 'crm_user'
 CRM_PASSWORD = 'crm_password'
+
+MINIO_ENDPOINT = 'minio:9000'
+MINIO_ACCESS_KEY = 'minio_user'
+MINIO_SECRET_KEY = 'minio_password'
+MINIO_BUCKET = 'reports'
 
 
 # ── Task-функции ────────────────────────────────────────────────────────────
@@ -178,6 +184,38 @@ def verify_view(**context):
               f"signals={row[3]}, avg_amp={row[4]}")
 
 
+def invalidate_s3_cache(**context):
+    """Очищаем кэш отчётов в S3 после обновления витрины.
+
+    После перестроения витрины старые отчёты в S3 содержат устаревшие данные.
+    Удаляем все объекты из bucket 'reports' — при следующем запросе пользователя
+    Report Service сгенерирует свежий отчёт из обновлённой витрины.
+    """
+    from minio import Minio
+
+    client = Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=False,
+    )
+
+    # Проверяем, что bucket существует
+    if not client.bucket_exists(MINIO_BUCKET):
+        print(f"Bucket '{MINIO_BUCKET}' не существует, пропускаем очистку")
+        return
+
+    # Удаляем все объекты
+    objects = client.list_objects(MINIO_BUCKET, recursive=True)
+    deleted = 0
+    for obj in objects:
+        client.remove_object(MINIO_BUCKET, obj.object_name)
+        deleted += 1
+
+    context['ti'].xcom_push(key='s3_deleted', value=deleted)
+    print(f"S3 кэш очищен: удалено {deleted} объектов из bucket '{MINIO_BUCKET}'")
+
+
 # ── DAG ─────────────────────────────────────────────────────────────────────
 
 default_args = {
@@ -216,5 +254,10 @@ with DAG(
         python_callable=verify_view,
     )
 
+    t_invalidate_s3 = PythonOperator(
+        task_id='invalidate_s3_cache',
+        python_callable=invalidate_s3_cache,
+    )
+
     # Зависимости: линейная цепочка
-    t_check >> t_truncate >> t_build >> t_verify
+    t_check >> t_truncate >> t_build >> t_verify >> t_invalidate_s3

@@ -2,56 +2,64 @@ package bionicpro.reports.handler;
 
 import bionicpro.reports.auth.JwtUtil;
 import bionicpro.reports.clickhouse.ClickHouseClient;
+import bionicpro.reports.s3.S3ReportStore;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.http.Context;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Обработчик запросов на отчёты.
+ * Обработчик запросов на отчёты с кэшированием в S3.
+ * <p>
+ * Flow:
+ * <ol>
+ *   <li>Извлечь userId из JWT</li>
+ *   <li>Проверить S3: HEAD reports/{userId}/report.json</li>
+ *   <li>Если есть → вернуть из S3 + CDN URL</li>
+ *   <li>Если нет → запросить ClickHouse → сохранить в S3 → вернуть + CDN URL</li>
+ * </ol>
  * <p>
  * Два endpoint'а:
  * <ul>
  *   <li>{@code GET /reports/me} — userId из JWT (основной, для фронтенда через BFF)</li>
- *   <li>{@code GET /reports/{userId}} — userId из пути (проверяет совпадение с JWT sub)</li>
+ *   <li>{@code GET /reports/{userId}} — userId из пути (проверка: sub == userId)</li>
  * </ul>
  */
 public class ReportHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ReportHandler.class);
+    private static final ObjectMapper mapper = new ObjectMapper();
 
     private final ClickHouseClient ch;
+    private final S3ReportStore s3;
 
-    public ReportHandler(ClickHouseClient ch) {
+    public ReportHandler(ClickHouseClient ch, S3ReportStore s3) {
         this.ch = ch;
+        this.s3 = s3;
     }
 
     /**
-     * GET /reports/me
-     * <p>
-     * Фронтенд вызывает /api/reports/me → BFF проксирует как /reports/me.
-     * userId извлекается из JWT claim "sub".
+     * GET /reports/me — userId из JWT.
      */
     public void getMyReport(Context ctx) {
         int userId = extractAndValidateToken(ctx);
-        if (userId < 0) return; // ответ уже отправлен
+        if (userId < 0) return;
 
         fetchAndReturnReport(ctx, userId);
     }
 
     /**
-     * GET /reports/{userId}
-     * <p>
-     * Прямой доступ по userId. Проверяет, что запрошенный userId совпадает
-     * с sub из JWT — пользователь может запрашивать только свой отчёт.
+     * GET /reports/{userId} — проверяет, что sub == userId.
      */
     public void getReport(Context ctx) {
         int tokenUserId = extractAndValidateToken(ctx);
-        if (tokenUserId < 0) return; // ответ уже отправлен
+        if (tokenUserId < 0) return;
 
-        // Проверить авторизацию: отчёт только по себе
         String requestedParam = ctx.pathParam("userId");
         int requestedUserId;
         try {
@@ -73,13 +81,88 @@ public class ReportHandler {
         fetchAndReturnReport(ctx, requestedUserId);
     }
 
-    // ── Shared logic ───────────────────────────────────────────────────
+    // ── Core logic ─────────────────────────────────────────────────────
 
-    /**
-     * Извлекает и валидирует JWT из Authorization header.
-     *
-     * @return userId (>= 0) при успехе, -1 при ошибке (ответ уже отправлен)
-     */
+    private void fetchAndReturnReport(Context ctx, int userId) {
+        try {
+            // ── 1. Проверить S3 ────────────────────────────────────────
+            if (s3.exists(userId)) {
+                var cached = s3.get(userId);
+                if (cached.isPresent()) {
+                    log.info("Report served from S3: userId={}", userId);
+
+                    // Парсим JSON из S3 и добавляем cdnUrl
+                    Map<String, Object> report = mapper.readValue(
+                            cached.get(), new TypeReference<>() {});
+                    report.put("cdnUrl", s3.cdnUrl(userId));
+                    report.put("source", "s3");
+
+                    ctx.json(report);
+                    return;
+                }
+            }
+
+            // ── 2. Генерировать из ClickHouse ──────────────────────────
+            List<Map<String, Object>> rows = ch.queryUserReport(userId);
+
+            if (rows.isEmpty()) {
+                ctx.status(404).json(Map.of(
+                        "error", "Report not found",
+                        "message", "No report available for this user. "
+                                + "Reports are generated daily by ETL process."
+                ));
+                return;
+            }
+
+            // ── 3. Сформировать JSON отчёта ────────────────────────────
+            Map<String, Object> report = buildReportJson(userId, rows);
+
+            // ── 4. Сохранить в S3 ──────────────────────────────────────
+            String reportJson = mapper.writeValueAsString(report);
+            s3.put(userId, reportJson);
+
+            // ── 5. Вернуть ответ с CDN URL ─────────────────────────────
+            report.put("cdnUrl", s3.cdnUrl(userId));
+            report.put("source", "clickhouse");
+
+            ctx.json(report);
+            log.info("Report generated and cached: userId={}, prostheses={}",
+                    userId, rows.size());
+
+        } catch (Exception e) {
+            log.error("Report request failed for userId={}: {}", userId, e.getMessage(), e);
+            ctx.status(500).json(Map.of("error", "Internal server error"));
+        }
+    }
+
+    private Map<String, Object> buildReportJson(int userId, List<Map<String, Object>> rows) {
+        String customerName = rows.getFirst().getOrDefault("customer_name", "").toString();
+        String customerEmail = rows.getFirst().getOrDefault("customer_email", "").toString();
+        String reportUpdated = rows.getFirst().getOrDefault("report_updated", "").toString();
+
+        // LinkedHashMap сохраняет порядок ключей в JSON
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("userId", userId);
+        report.put("customerName", customerName);
+        report.put("customerEmail", customerEmail);
+        report.put("reportUpdated", reportUpdated);
+        report.put("prostheses", rows.stream().map(row -> {
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("prosthesisType", row.getOrDefault("prosthesis_type", ""));
+            p.put("totalSignals", row.getOrDefault("total_signals", 0));
+            p.put("avgAmplitude", row.getOrDefault("avg_amplitude", 0));
+            p.put("avgFrequency", row.getOrDefault("avg_frequency", 0));
+            p.put("avgDuration", row.getOrDefault("avg_duration", 0));
+            p.put("minSignalTime", row.getOrDefault("min_signal_time", ""));
+            p.put("maxSignalTime", row.getOrDefault("max_signal_time", ""));
+            return p;
+        }).toList());
+
+        return report;
+    }
+
+    // ── JWT validation ─────────────────────────────────────────────────
+
     private int extractAndValidateToken(Context ctx) {
         String authHeader = ctx.header("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -108,51 +191,6 @@ public class ReportHandler {
         } catch (NumberFormatException e) {
             ctx.status(400).json(Map.of("error", "JWT sub is not a valid user ID"));
             return -1;
-        }
-    }
-
-    /**
-     * Запрашивает отчёт из ClickHouse и возвращает JSON.
-     */
-    private void fetchAndReturnReport(Context ctx, int userId) {
-        try {
-            List<Map<String, Object>> rows = ch.queryUserReport(userId);
-
-            if (rows.isEmpty()) {
-                ctx.status(404).json(Map.of(
-                        "error", "Report not found",
-                        "message", "No report available for this user. "
-                                + "Reports are generated daily by ETL process."
-                ));
-                return;
-            }
-
-            // Первая строка содержит имя/email (одинаковые для всех prosthesis_type)
-            String customerName = rows.getFirst().getOrDefault("customer_name", "").toString();
-            String customerEmail = rows.getFirst().getOrDefault("customer_email", "").toString();
-            String reportUpdated = rows.getFirst().getOrDefault("report_updated", "").toString();
-
-            ctx.json(Map.of(
-                    "userId", userId,
-                    "customerName", customerName,
-                    "customerEmail", customerEmail,
-                    "reportUpdated", reportUpdated,
-                    "prostheses", rows.stream().map(row -> Map.of(
-                            "prosthesisType", row.getOrDefault("prosthesis_type", ""),
-                            "totalSignals", row.getOrDefault("total_signals", 0),
-                            "avgAmplitude", row.getOrDefault("avg_amplitude", 0),
-                            "avgFrequency", row.getOrDefault("avg_frequency", 0),
-                            "avgDuration", row.getOrDefault("avg_duration", 0),
-                            "minSignalTime", row.getOrDefault("min_signal_time", ""),
-                            "maxSignalTime", row.getOrDefault("max_signal_time", "")
-                    )).toList()
-            ));
-
-            log.info("Report served: userId={}, prostheses={}", userId, rows.size());
-
-        } catch (Exception e) {
-            log.error("ClickHouse query failed for userId={}: {}", userId, e.getMessage(), e);
-            ctx.status(500).json(Map.of("error", "Internal server error"));
         }
     }
 }
