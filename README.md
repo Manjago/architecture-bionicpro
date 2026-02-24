@@ -11,7 +11,7 @@
 | 1 | Повышение безопасности | BFF + PKCE + LDAP + MFA + Яндекс ID | ✅ Готово |
 | 2 | Сервис отчётов | Airflow ETL → ClickHouse → Report API | ✅ Готово |
 | 3 | Снижение нагрузки на БД | S3 + CDN (Nginx) кэширование отчётов | ✅ Готово |
-| 4 | Оперативность CRM | CDC через Debezium → Kafka → ClickHouse | ⏳ |
+| 4 | Оперативность CRM | CDC через Debezium → Kafka → ClickHouse | ✅ Готово |
 
 ## Структура репозитория
 
@@ -36,7 +36,7 @@ architecture-bionicpro/
 │       └── util/
 │           ├── PkceUtil.java            ← code_verifier / code_challenge / SecureRandom ID
 │           └── CookieUtil.java          ← HttpOnly + SameSite=Strict cookies
-├── report-service/          ← Задание 2+3: Report API + S3 кэш (Java 25, Javalin)
+├── report-service/          ← Задание 2+3+4: Report API + S3 кэш + CDC витрина (Java 25, Javalin)
 │   ├── pom.xml
 │   ├── Dockerfile
 │   └── src/main/java/bionicpro/reports/
@@ -45,7 +45,7 @@ architecture-bionicpro/
 │       │   ├── ReportHandler.java       ← GET /reports/me + /reports/{userId} + S3 кэш
 │       │   └── HealthHandler.java       ← GET /health (CH + S3 статус)
 │       ├── clickhouse/
-│       │   └── ClickHouseClient.java    ← HTTP-запросы к ClickHouse (java.net.http)
+│       │   └── ClickHouseClient.java    ← HTTP-запросы к ClickHouse, витрина через env REPORT_VIEW
 │       ├── s3/
 │       │   └── S3ReportStore.java       ← MinIO: check/get/put отчётов, CDN URL
 │       └── auth/
@@ -54,7 +54,8 @@ architecture-bionicpro/
 │   └── dags/
 │       └── etl_reports.py               ← DAG: CRM + телеметрия → витрина ClickHouse
 ├── olap-db/                 ← ClickHouse: init-скрипты, данные
-│   ├── init.sql                         ← emg_sensor_data + user_reports (витрина)
+│   ├── init.sql                         ← emg_sensor_data + user_reports (витрина batch)
+│   ├── init-cdc.sql                     ← KafkaEngine + MV + crm_customers + user_reports_cdc
 │   ├── olap.csv                         ← Тестовые данные телеметрии (5000 записей)
 │   └── users.xml                        ← Конфиг доступа (без пароля, dev)
 ├── crm-db/                  ← CRM: init-скрипт, данные
@@ -78,10 +79,13 @@ architecture-bionicpro/
 │   ├── Auth_Logout_Flow.puml / .png
 │   ├── ETL_Reports_Architecture.puml / .png
 │   ├── Report_Request_Flow.puml / .png
-│   └── S3_CDN_Cache_Flow.puml / .png
+│   ├── S3_CDN_Cache_Flow.puml / .png
+│   └── CDC_CRM_Flow.puml / .png
 ├── nginx/                   ← Задание 3: CDN — Nginx reverse proxy + cache
 │   └── nginx.conf                       ← proxy_cache → MinIO, TTL 24h, X-Cache-Status
 ├── debezium/                ← Задание 4: CDC connector config
+│   ├── register-connector.json          ← Конфиг Debezium PostgreSQL connector
+│   └── register-connector.sh            ← Скрипт регистрации через Kafka Connect REST API
 ├── docker-compose.yaml      ← Полная конфигурация развёртывания
 └── README.md                ← Этот файл
 ```
@@ -698,4 +702,240 @@ Volumes: добавлен `nginx_cache` для персистентного кэ
 
 ---
 
-*Задание 4 будет дополнено по мере выполнения.*
+## Задание 4. Повышение оперативности и стабильности работы CRM
+
+### Проблема
+
+CRM PostgreSQL перегружена массовыми выгрузками для отчётности (Airflow DAG из задания 2 делает `SELECT * FROM customers` при каждом запуске ETL). Это создаёт long-running транзакции, давит на MVCC, раздувает WAL. OLTP-запросы операторов CRM замедляются и падают по таймауту.
+
+### Решение: CDC через Debezium → Kafka → ClickHouse
+
+Вместо batch-выгрузки — потоковый CDC (Change Data Capture). Debezium читает WAL PostgreSQL через logical replication. CRM не испытывает дополнительной нагрузки: WAL пишется в любом случае, Debezium лишь подписывается на поток.
+
+```
+CRM PostgreSQL ──WAL──→ Debezium ──→ Kafka ──→ ClickHouse KafkaEngine
+                (logical repl.)                      ↓
+                                              MaterializedView
+                                                     ↓
+                                              crm_customers (ReplacingMergeTree)
+                                                     +
+                                              emg_sensor_data (batch, Airflow)
+                                                     ↓
+                                              user_reports_cdc (VIEW)
+                                                     ↓
+                                              Report Service API
+```
+
+**Параллельное существование:** Airflow DAG и batch-витрина `user_reports` (задание 2) сохранены. CDC-пайплайн — параллельный набор сервисов. Переключение Report Service на CDC-витрину — через env `REPORT_VIEW=user_reports_cdc`.
+
+### Диаграмма
+
+#### CDC CRM Data Flow (Sequence Diagram)
+
+Полный CDC-pipeline: initial snapshot, штатная работа через WAL, KafkaEngine → MV → target, обработка UPDATE и DELETE.
+
+[Исходник PlantUML](diagrams/CDC_CRM_Flow.puml)
+
+![CDC CRM Flow](diagrams/CDC_CRM_Flow.png)
+
+---
+
+### Задача 4.1 — CDC через Debezium
+
+→ `debezium/register-connector.json`
+→ `debezium/register-connector.sh`
+
+**Debezium PostgreSQL Connector** читает WAL через `pgoutput` (встроенный плагин PostgreSQL 10+, без дополнительных расширений).
+
+Ключевые параметры конфигурации:
+
+| Параметр | Значение | Почему |
+|----------|---------|--------|
+| `plugin.name` | `pgoutput` | Встроен в PostgreSQL, не нужно устанавливать `decoderbufs` |
+| `topic.prefix` | `crm` | Топик: `crm.public.customers` |
+| `table.include.list` | `public.customers` | Захватываем только нужную таблицу |
+| `snapshot.mode` | `initial` | Первый запуск: полный snapshot, потом только WAL |
+| `schemas.enable` | `false` | Упрощённый JSON (без встроенной JSON Schema) |
+| `delete.handling.mode` | `rewrite` | При DELETE: полное событие с `__deleted=true` вместо tombstone |
+| `heartbeat.interval.ms` | `10000` | Heartbeat каждые 10с — чтобы WAL slot не разрастался |
+
+CRM PostgreSQL настроен с `wal_level=logical` (через `command` в docker-compose).
+
+Регистрация коннектора — через REST API Kafka Connect:
+```bash
+./debezium/register-connector.sh
+# Ждёт готовности Kafka Connect, затем POST /connectors
+```
+
+---
+
+### Задача 4.2 — Kafka
+
+→ `docker-compose.yaml` (сервисы `zookeeper`, `kafka`, `kafka-connect`)
+
+Три новых сервиса:
+
+| Сервис | Образ | Порт | Назначение |
+|--------|-------|------|-----------|
+| `zookeeper` | confluentinc/cp-zookeeper:7.5.3 | 2181 | Координация Kafka |
+| `kafka` | confluentinc/cp-kafka:7.5.3 | 9092 (хост) / 29092 (docker) | Брокер сообщений |
+| `kafka-connect` | debezium/connect:2.4 | 8083 | Платформа для Debezium connector |
+
+Kafka с двумя listener'ами: `INTERNAL` (kafka:29092, для Docker-сети) и `EXTERNAL` (localhost:9092, для отладки с хоста). ClickHouse подключается к `kafka:29092`.
+
+Образ `debezium/connect:2.4` уже содержит PostgreSQL-коннектор — ничего дополнительно устанавливать не нужно.
+
+---
+
+### Задача 4.3 — KafkaEngine в ClickHouse
+
+→ `olap-db/init-cdc.sql`
+
+Четыре объекта, выполняются после `init.sql` (алфавитный порядок):
+
+**1. `crm_customers_queue`** (KafkaEngine) — виртуальная очередь, читает сырой JSON из топика `crm.public.customers`. Формат `JSONAsString` — каждое сообщение целиком как строка.
+
+**2. `crm_customers`** (ReplacingMergeTree) — CDC-реплика таблицы CRM. `ORDER BY id`, дедупликация по `_ts` (timestamp события). Колонка `_is_deleted` для обработки DELETE.
+
+**3. `crm_customers_mv`** (MaterializedView) — автоматический триггер: при появлении сообщений в KafkaEngine парсит Debezium JSON через `JSONExtract*`, вставляет в `crm_customers`. Обрабатывает все типы операций:
+
+| op | Debezium | Что делает MV |
+|----|----------|---------------|
+| `r` | Snapshot (initial) | INSERT, `_is_deleted=0` |
+| `c` | Create (INSERT) | INSERT, `_is_deleted=0` |
+| `u` | Update (UPDATE) | INSERT новой версии, ReplacingMergeTree заменит старую |
+| `d` | Delete (DELETE) | INSERT с `_is_deleted=1`, фильтруется при чтении |
+
+---
+
+### Задача 4.4 — Витрина MaterializedView
+
+→ `olap-db/init-cdc.sql` (секция 4)
+
+**`user_reports_cdc`** (VIEW) — параллельная витрина, объединяющая CDC-данные CRM с телеметрией:
+
+```sql
+SELECT ... FROM crm_customers FINAL AS c
+INNER JOIN emg_sensor_data AS e ON c.id = e.user_id
+WHERE c._is_deleted = 0
+GROUP BY c.id, c.name, c.email, e.prosthesis_type
+```
+
+Ключевые решения:
+
+- **`FINAL`** — заставляет ReplacingMergeTree дедуплицировать строки на лету (без ожидания фонового merge). В проде с большими объёмами → периодический `OPTIMIZE TABLE` или MV с предагрегацией.
+- **VIEW, не MATERIALIZED VIEW** — CRM-данные обновляются через CDC в near real-time, телеметрия через Airflow batch. MV срабатывал бы только при INSERT в один источник. VIEW пересчитывает JOIN при каждом SELECT — для учебного проекта достаточно.
+- **Структура колонок** совпадает с `user_reports` (задание 2): `user_id`, `customer_name`, `customer_email`, `prosthesis_type`, `total_signals`, `avg_amplitude`, `avg_frequency`, `avg_duration`, `min_signal_time`, `max_signal_time`, `report_updated`. Это позволяет переключаться между витринами без изменения Report Service.
+
+---
+
+### Задача 4.5 — Перевод API на новую витрину
+
+→ `report-service/.../clickhouse/ClickHouseClient.java`
+
+Изменение минимальное: `ClickHouseClient` принимает имя витрины через конструктор. SQL-запрос использует `FROM %s` вместо захардкоженного `FROM user_reports`.
+
+```java
+// ReportServer.java — одна строчка:
+String reportView = System.getenv().getOrDefault("REPORT_VIEW", "user_reports");
+new ClickHouseClient(chHost, chPort, reportView);
+```
+
+В `docker-compose.yaml` для `report-service`:
+```yaml
+REPORT_VIEW: user_reports_cdc
+```
+
+**ReportHandler.java не изменён.** Вся логика (S3 кэш, JWT, CDN URL) работает одинаково для обеих витрин.
+
+---
+
+### Сравнение batch vs CDC
+
+| Аспект | Задание 2 (Airflow batch) | Задание 4 (CDC) |
+|--------|--------------------------|-----------------|
+| Источник CRM-данных | `SELECT * FROM customers` | WAL (logical replication) |
+| Нагрузка на CRM | Высокая (full table scan) | Минимальная (чтение WAL) |
+| Задержка данных | До 24ч (ETL @daily) | Секунды (near real-time) |
+| Обработка UPDATE/DELETE | Перезапись всей витрины | ReplacingMergeTree + `_is_deleted` |
+| Витрина | `user_reports` (MergeTree, Airflow fill) | `user_reports_cdc` (VIEW, JOIN on-the-fly) |
+| Инфраструктура | Airflow | + Zookeeper + Kafka + Kafka Connect + Debezium |
+
+---
+
+### Изменения в docker-compose.yaml (задание 4)
+
+Новые сервисы:
+
+| Сервис | Образ | Порт | Назначение |
+|--------|-------|------|-----------|
+| `zookeeper` | confluentinc/cp-zookeeper:7.5.3 | 2181 | Координация Kafka |
+| `kafka` | confluentinc/cp-kafka:7.5.3 | 9092 / 29092 | Брокер сообщений |
+| `kafka-connect` | debezium/connect:2.4 | 8083 | Debezium PostgreSQL connector |
+
+Изменённые сервисы:
+
+| Сервис | Что изменилось |
+|--------|---------------|
+| `crm_db` | Добавлен `command: postgres -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4` |
+| `report-service` | Добавлена env `REPORT_VIEW: user_reports_cdc` |
+| `olap_db` | Добавлен `depends_on: kafka: condition: service_healthy` (KafkaEngine нужен живой Kafka) |
+
+---
+
+### Deliverables задания 4
+
+- [x] Sequence Diagram: CDC Data Flow (`diagrams/CDC_CRM_Flow.puml`)
+- [x] Конфигурация Debezium connector (`debezium/register-connector.json`)
+- [x] Скрипт регистрации коннектора (`debezium/register-connector.sh`)
+- [x] KafkaEngine + MaterializedView + CDC-реплика CRM (`olap-db/init-cdc.sql`)
+- [x] Витрина `user_reports_cdc` с JOIN CRM + телеметрия (`olap-db/init-cdc.sql`)
+- [x] Report Service: параметризуемая витрина (`report-service/.../clickhouse/ClickHouseClient.java`)
+- [x] Kafka + Zookeeper + Kafka Connect в `docker-compose.yaml`
+- [x] CRM PostgreSQL: `wal_level=logical` в `docker-compose.yaml`
+- [ ] Интеграционный тест: full CDC pipeline. Требует `docker-compose up` + `register-connector.sh`.
+
+---
+
+## Запуск и проверка
+
+### Порядок запуска
+
+```bash
+# 1. Запустить все сервисы
+docker-compose up -d
+
+# 2. Дождаться готовности Kafka Connect (healthcheck ~30-60 сек)
+docker-compose logs -f kafka-connect | grep "started"
+
+# 3. Зарегистрировать Debezium connector
+./debezium/register-connector.sh
+
+# 4. Проверить статус
+curl -s http://localhost:8083/connectors/crm-connector/status | jq .
+
+# 5. Проверить, что данные попали в ClickHouse
+docker exec -it $(docker ps -q -f name=olap_db) \
+    clickhouse-client --query "SELECT count() FROM crm_customers"
+# Должно вернуть 1000 (initial snapshot)
+
+# 6. Проверить витрину
+docker exec -it $(docker ps -q -f name=olap_db) \
+    clickhouse-client --query "SELECT * FROM user_reports_cdc LIMIT 5"
+```
+
+### Порты сервисов
+
+| Порт | Сервис | Назначение |
+|------|--------|-----------|
+| 3000 | Frontend | React UI |
+| 8000 | bionicpro-auth | BFF (login, proxy, logout) |
+| 8001 | report-service | API /reports |
+| 8080 | Keycloak | Identity Provider |
+| 8083 | Kafka Connect | Debezium REST API |
+| 8085 | Airflow | Webserver UI |
+| 8088 | Nginx | CDN (reverse proxy к MinIO) |
+| 8123 | ClickHouse | HTTP interface |
+| 9000 | MinIO | S3 API |
+| 9001 | MinIO | Console UI |
+| 9092 | Kafka | External listener (хост) |
