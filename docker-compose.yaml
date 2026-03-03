@@ -33,7 +33,7 @@ services:
       - "8001:8001"
     environment:
       PORT: "8001"
-      CLICKHOUSE_HOST: olap_db
+      CLICKHOUSE_HOST: olapdb
       CLICKHOUSE_PORT: "8123"
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: minio_user
@@ -138,6 +138,10 @@ services:
   # === OLAP Database (ClickHouse) ===
   olap_db:
     image: clickhouse/clickhouse-server:24.8
+    networks:
+      default:
+        aliases:
+          - olapdb
     ports:
       - "8123:8123"
       - "9431:9000"
@@ -199,12 +203,14 @@ services:
   airflow-init:
     image: apache/airflow:2.8.1
     entrypoint: /bin/bash
-    command: >
-      -c "airflow db init &&
-          airflow users create
-            --username admin --password admin
-            --firstname Admin --lastname User
-            --role Admin --email admin@example.com"
+    command:
+      - -c
+      - |
+        airflow db init &&
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
@@ -258,7 +264,7 @@ services:
     ports:
       - "2181:2181"
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/commands/ruok || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

@@ -140,7 +140,7 @@ SELECT
     min(e.signal_time)                          AS min_signal_time,
     max(e.signal_time)                          AS max_signal_time,
     now()                                       AS report_updated
-FROM crm_customers FINAL AS c
+FROM (SELECT * FROM crm_customers FINAL) AS c
 INNER JOIN emg_sensor_data AS e
     ON c.id = e.user_id
 WHERE c._is_deleted = 0

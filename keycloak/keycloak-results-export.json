@@ -239,10 +239,10 @@
                 "membership.ldap.attribute": ["member"],
                 "membership.attribute.type": ["DN"],
                 "membership.user.ldap.attribute": ["uid"],
-                "groups.ldap.filter": [],
+                "groups.ldap.filter": [""],
                 "mode": ["READ_ONLY"],
                 "user.roles.retrieve.strategy": ["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"],
-                "mapped.group.attributes": [],
+                "mapped.group.attributes": [""],
                 "drop.non.existing.groups.during.sync": ["false"],
                 "groups.path": ["/"]
               }
