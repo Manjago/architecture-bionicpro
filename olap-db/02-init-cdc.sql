@@ -1,8 +1,8 @@
 -- =============================================================================
 -- Задание 4: CDC pipeline — Kafka → ClickHouse
--- Файл: olap-db/init-cdc.sql
+-- Файл: olap-db/02-init-cdc.sql
 --
--- Выполняется ПОСЛЕ init.sql (задание 2).
+-- Выполняется ПОСЛЕ 01-init.sql (задание 2).
 -- Не трогает существующие таблицы (emg_sensor_data, user_reports).
 -- =============================================================================
 
@@ -13,6 +13,10 @@
 -- Каждая строка = одно Debezium-событие в формате JSONAsString.
 -- SELECT из неё забирает сообщения и коммитит offset.
 -- Напрямую не читаем — только через MaterializedView.
+--
+-- kafka_group_name: уникальное имя consumer group.
+-- При пересоздании таблицы offset НЕ сбрасывается (хранится в Kafka).
+-- Чтобы перечитать данные — нужно сменить имя группы.
 -- -----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS crm_customers_queue (
@@ -21,7 +25,7 @@ CREATE TABLE IF NOT EXISTS crm_customers_queue (
 SETTINGS
     kafka_broker_list = 'kafka:29092',
     kafka_topic_list = 'crm.public.customers',
-    kafka_group_name = 'clickhouse-crm-cdc',
+    kafka_group_name = 'clickhouse-crm-cdc-v2',
     kafka_format = 'JSONAsString',
     kafka_max_block_size = 1048576,
     kafka_poll_timeout_ms = 1000;
@@ -57,57 +61,55 @@ ORDER BY id;
 -- 3. MaterializedView: JSON из Kafka → crm_customers
 -- -----------------------------------------------------------------------------
 -- Автоматически срабатывает при появлении новых сообщений в KafkaEngine.
--- Парсит JSON, извлекает поля из payload.after (для INSERT/UPDATE)
--- или payload.before (для DELETE — after будет null).
+-- Парсит JSON, извлекает поля из after (для INSERT/UPDATE)
+-- или before (для DELETE — after будет null).
 --
--- Формат Debezium (schemas.enable=false):
+-- Формат Debezium (schemas.enable=false, без обёртки payload):
 -- {
---   "payload": {
---     "before": {...} | null,
---     "after":  {...} | null,
---     "op": "c" | "u" | "d" | "r",
---     "ts_ms": 1708123456789,
---     "source": {...}
---   }
+--   "before": {...} | null,
+--   "after":  {...} | null,
+--   "op": "c" | "u" | "d" | "r",
+--   "ts_ms": 1708123456789,
+--   "source": {...}
 -- }
 --
--- С delete.handling.mode=rewrite: при DELETE поле after содержит данные
--- + дополнительное поле "__deleted": "true".
+-- Примечание: поле age в CRM хранится как NUMERIC, Debezium
+-- кодирует его как {"scale":0,"value":"base64..."}.
+-- Декодировать нетривиально, а для витрины отчётов age не используется,
+-- поэтому ставим 0. В проде → кастомный SMT или обработка на стороне MV.
 -- -----------------------------------------------------------------------------
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS crm_customers_mv TO crm_customers AS
 SELECT
     -- Для DELETE after может быть null → берём из before
     coalesce(
-        JSONExtractUInt(raw, 'payload', 'after', 'id'),
-        JSONExtractUInt(raw, 'payload', 'before', 'id')
+        JSONExtractUInt(raw, 'after', 'id'),
+        JSONExtractUInt(raw, 'before', 'id')
     ) AS id,
 
-    JSONExtractString(raw, 'payload', 'after', 'name')    AS name,
-    JSONExtractString(raw, 'payload', 'after', 'email')   AS email,
+    JSONExtractString(raw, 'after', 'name')    AS name,
+    JSONExtractString(raw, 'after', 'email')   AS email,
 
-    toUInt8(coalesce(
-        JSONExtractUInt(raw, 'payload', 'after', 'age'),
-        0
-    )) AS age,
+    -- age: Debezium decimal (base64) → не декодируем, для отчётов не нужен
+    toUInt8(0) AS age,
 
-    JSONExtractString(raw, 'payload', 'after', 'gender')  AS gender,
-    JSONExtractString(raw, 'payload', 'after', 'country') AS country,
-    JSONExtractString(raw, 'payload', 'after', 'address') AS address,
-    JSONExtractString(raw, 'payload', 'after', 'phone')   AS phone,
+    JSONExtractString(raw, 'after', 'gender')  AS gender,
+    JSONExtractString(raw, 'after', 'country') AS country,
+    JSONExtractString(raw, 'after', 'address') AS address,
+    JSONExtractString(raw, 'after', 'phone')   AS phone,
 
     -- Тип операции: c=create, u=update, d=delete, r=read(snapshot)
-    JSONExtractString(raw, 'payload', 'op') AS _op,
+    JSONExtractString(raw, 'op') AS _op,
 
     -- delete.handling.mode=rewrite: Debezium добавляет __deleted в after
     if(
-        JSONExtractString(raw, 'payload', 'after', '__deleted') = 'true'
-        OR JSONExtractString(raw, 'payload', 'op') = 'd',
+        JSONExtractString(raw, 'after', '__deleted') = 'true'
+        OR JSONExtractString(raw, 'op') = 'd',
         1, 0
     ) AS _is_deleted,
 
     fromUnixTimestamp64Milli(
-        JSONExtractUInt(raw, 'payload', 'ts_ms')
+        JSONExtractUInt(raw, 'ts_ms')
     ) AS _ts
 
 FROM crm_customers_queue;
@@ -123,8 +125,10 @@ FROM crm_customers_queue;
 --     JOIN двух таблиц, одна из которых (emg_sensor_data) заполняется Airflow
 --   - Для учебного проекта VIEW достаточно; в проде → периодический INSERT
 --
--- Структура витрины совпадает с user_reports из задания 2 + добавлено
--- поле source='cdc' для отладки.
+-- Структура витрины совпадает с user_reports из задания 2.
+--
+-- FINAL в подзапросе: ClickHouse 24.8 не поддерживает синтаксис
+-- "FROM table FINAL AS alias", поэтому оборачиваем в подзапрос.
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW user_reports_cdc AS
