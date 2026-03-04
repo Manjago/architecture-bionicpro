@@ -163,6 +163,18 @@ public class ReportHandler {
 
     // ── JWT validation ─────────────────────────────────────────────────
 
+    /**
+     * Извлекает userId из заголовков, установленных BFF.
+     *
+     * BFF (ProxyHandler) добавляет:
+     * - Authorization: Bearer <token> (для аутентификации)
+     * - X-CRM-User-Id: <число> (числовой ID пользователя в CRM)
+     *
+     * DEMO: CRM ID извлекается из username (prothetic1 → 1).
+     * В production: CRM ID должен быть claim в JWT (crm_user_id),
+     * заданный через Keycloak User Attribute + Protocol Mapper.
+     * Тогда здесь можно парсить его прямо из JWT claims.
+     */
     private int extractAndValidateToken(Context ctx) {
         String authHeader = ctx.header("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -170,6 +182,17 @@ public class ReportHandler {
             return -1;
         }
 
+        // Числовой CRM ID из заголовка BFF
+        String crmUserIdHeader = ctx.header("X-CRM-User-Id");
+        if (crmUserIdHeader != null) {
+            try {
+                return Integer.parseInt(crmUserIdHeader);
+            } catch (NumberFormatException e) {
+                log.warn("Invalid X-CRM-User-Id header: {}", crmUserIdHeader);
+            }
+        }
+
+        // Fallback: попробовать sub из JWT (если вызов не через BFF)
         String token = authHeader.substring("Bearer ".length());
         Map<String, Object> claims;
         try {
@@ -189,7 +212,10 @@ public class ReportHandler {
         try {
             return Integer.parseInt(subClaim.toString());
         } catch (NumberFormatException e) {
-            ctx.status(400).json(Map.of("error", "JWT sub is not a valid user ID"));
+            ctx.status(400).json(Map.of(
+                    "error", "Cannot determine numeric user ID. "
+                    + "JWT sub is UUID; X-CRM-User-Id header not provided."
+            ));
             return -1;
         }
     }

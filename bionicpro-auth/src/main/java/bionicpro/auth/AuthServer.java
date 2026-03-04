@@ -28,6 +28,7 @@ public class AuthServer {
 
     // Конфигурация из переменных окружения (с дефолтами для локальной разработки)
     public static final String KEYCLOAK_URL = env("KEYCLOAK_URL", "http://localhost:8080");
+    public static final String KEYCLOAK_EXTERNAL_URL = env("KEYCLOAK_EXTERNAL_URL", "http://localhost:8080");
     public static final String KEYCLOAK_REALM = env("KEYCLOAK_REALM", "reports-realm");
     public static final String CLIENT_ID = env("KEYCLOAK_CLIENT_ID", "reports-frontend");
     public static final String CLIENT_SECRET = env("KEYCLOAK_CLIENT_SECRET", "change-me-in-production");
@@ -43,7 +44,7 @@ public class AuthServer {
 
     public static void main(String[] args) {
         var sessionStore = new InMemorySessionStore(SESSION_TTL_SECONDS);
-        var keycloakClient = new KeycloakClient(KEYCLOAK_URL, KEYCLOAK_REALM, CLIENT_ID, CLIENT_SECRET);
+        var keycloakClient = new KeycloakClient(KEYCLOAK_URL, KEYCLOAK_EXTERNAL_URL, KEYCLOAK_REALM, CLIENT_ID, CLIENT_SECRET);
 
         // Фоновая очистка истёкших сессий (каждые 5 минут)
         var scheduler = Executors.newSingleThreadScheduledExecutor(r -> {

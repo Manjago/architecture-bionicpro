@@ -8,6 +8,7 @@ services:
       - "8000:8000"
     environment:
       KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_EXTERNAL_URL: http://localhost:8080
       KEYCLOAK_REALM: reports-realm
       KEYCLOAK_CLIENT_ID: reports-frontend
       KEYCLOAK_CLIENT_SECRET: bff-client-secret-change-me
@@ -91,10 +92,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
-    environment:
-      # BFF-паттерн: фронтенд НЕ знает про Keycloak.
-      # Все запросы идут через BFF (bionicpro-auth).
-      REACT_APP_BFF_URL: http://localhost:8000
+    depends_on:
+      - bionicpro-auth
+      - nginx
 
   # === LDAP (Task 1.4) ===
   openldap:

@@ -33,11 +33,12 @@ public class KeycloakClient {
     private final String clientSecret;
     private final HttpClient httpClient;
 
-    public KeycloakClient(String keycloakUrl, String realm, String clientId, String clientSecret) {
+    public KeycloakClient(String keycloakUrl, String keycloakExternalUrl, String realm, String clientId, String clientSecret) {
         var realmBase = keycloakUrl + "/realms/" + realm + "/protocol/openid-connect";
-        this.tokenUrl = realmBase + "/token";
-        this.authUrl = realmBase + "/auth";
-        this.logoutUrl = realmBase + "/logout";
+        var realmBaseExternal = keycloakExternalUrl + "/realms/" + realm + "/protocol/openid-connect";
+        this.tokenUrl = realmBase + "/token";           // server-to-server
+        this.authUrl = realmBaseExternal + "/auth";      // browser redirect
+        this.logoutUrl = realmBaseExternal + "/logout";  // browser redirect
         this.clientId = clientId;
         this.clientSecret = clientSecret;
         this.httpClient = HttpClient.newHttpClient();

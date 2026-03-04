@@ -97,8 +97,11 @@ public class ProxyHandler {
     private void proxyRequest(Context ctx, SessionData session) {
         // Определяем downstream URL
         var path = ctx.path();  // например, /api/reports/me
+        // Report Service слушает /reports/*, не /api/reports/*
+        // Убираем /api prefix при проксировании
+        var downstreamPath = path.startsWith("/api") ? path.substring(4) : path;
         var downstreamBase = path.startsWith("/api/reports") ? REPORT_SERVICE_URL : API_BASE_URL;
-        var downstreamUrl = downstreamBase + path;
+        var downstreamUrl = downstreamBase + downstreamPath;
 
         // Добавляем query string если есть
         var queryString = ctx.queryString();
@@ -112,7 +115,10 @@ public class ProxyHandler {
                     .uri(URI.create(downstreamUrl))
                     .header("Authorization", "Bearer " + session.accessToken())
                     .header("X-User-Id", session.userId())
-                    .header("X-User-Roles", session.roles());
+                    .header("X-User-Roles", session.roles())
+                    // DEMO: извлекаем числовой CRM ID из username (prothetic1 → 1).
+                    // В проде → Keycloak user attribute + protocol mapper → claim crm_user_id в JWT.
+                    .header("X-CRM-User-Id", extractCrmUserId(session.username()));
 
             // Проксируем метод и тело
             if ("POST".equalsIgnoreCase(ctx.method().name()) && ctx.body() != null) {
@@ -143,4 +149,18 @@ public class ProxyHandler {
     private java.util.Map<String, String> errorJson(String message) {
         return java.util.Map.of("error", message);
     }
+
+    /**
+     * Извлекает числовой CRM user ID из Keycloak username.
+     * Пример: "prothetic1" → "1", "user42" → "42".
+     *
+     * DEMO-решение. В production-среде CRM ID должен быть claim в JWT
+     * (через Keycloak User Attribute + Protocol Mapper).
+     */
+    private static String extractCrmUserId(String username) {
+        if (username == null) return "0";
+        var m = java.util.regex.Pattern.compile("(\\d+)$").matcher(username);
+        return m.find() ? m.group(1) : "0";
+    }
+
 }
