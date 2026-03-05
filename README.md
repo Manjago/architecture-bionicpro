@@ -54,8 +54,8 @@ architecture-bionicpro/
 │   └── dags/
 │       └── etl_reports.py               ← DAG: CRM + телеметрия → витрина ClickHouse
 ├── olap-db/                 ← ClickHouse: init-скрипты, данные
-│   ├── init.sql                         ← emg_sensor_data + user_reports (витрина batch)
-│   ├── init-cdc.sql                     ← KafkaEngine + MV + crm_customers + user_reports_cdc
+│   ├── 01-init.sql                      ← emg_sensor_data + user_reports (витрина batch)
+│   ├── 02-init-cdc.sql                  ← KafkaEngine + MV + crm_customers + user_reports_cdc
 │   ├── olap.csv                         ← Тестовые данные телеметрии (5000 записей)
 │   └── users.xml                        ← Конфиг доступа (без пароля, dev)
 ├── crm-db/                  ← CRM: init-скрипт, данные
@@ -87,6 +87,8 @@ architecture-bionicpro/
 │   ├── register-connector.json          ← Конфиг Debezium PostgreSQL connector
 │   └── register-connector.sh            ← Скрипт регистрации через Kafka Connect REST API
 ├── docker-compose.yaml      ← Полная конфигурация развёртывания
+├── reset.sh                 ← Полный сброс данных (для перезапуска с нуля)
+├── screenshots/             ← Скриншоты smoke test
 └── README.md                ← Этот файл
 ```
 
@@ -322,7 +324,8 @@ Identity Provider настроен как OpenID Connect:
 - [x] Keycloak realm config: confidential client + PKCE + LDAP + MFA + Яндекс ID (`keycloak/keycloak-results-export.json`)
 - [x] LDAP config с исправленным багом (`ldap/config.ldif`)
 - [x] Обновлённый `docker-compose.yaml`
-- [ ] Интеграционный тест: полный auth flow (Keycloak + BFF + Frontend). Требует `docker-compose up` и регистрации приложения в Яндекс ID.
+- [x] Интеграционный тест: полный auth flow (Keycloak + BFF + Frontend). См. раздел «Результаты интеграционного тестирования».
+- [ ] Яндекс ID: требуется регистрация приложения на https://oauth.yandex.ru/ и подстановка реальных `clientId`/`clientSecret`.
 
 ---
 
@@ -414,7 +417,7 @@ check_sources → truncate_view → build_report_view → verify_view
 
 ### Задача 2.2 — ClickHouse: схема данных
 
-→ `olap-db/init.sql`
+→ `olap-db/01-init.sql`
 
 Две таблицы:
 
@@ -535,7 +538,7 @@ BFF `API_BASE_URL` обновлён на `http://report-service:8001`.
 
 - [x] Архитектура решения: C4 диаграмма (`diagrams/ETL_Reports_Architecture.puml`)
 - [x] Sequence Diagram: Report Request Flow (`diagrams/Report_Request_Flow.puml`)
-- [x] ClickHouse init-скрипты: сырые данные + витрина (`olap-db/init.sql`)
+- [x] ClickHouse init-скрипты: сырые данные + витрина (`olap-db/01-init.sql`)
 - [x] CRM init-скрипт + тестовые данные (`crm-db/init.sql`, `crm-db/crm.csv`)
 - [x] Airflow DAG: ETL с расписанием (`airflow/dags/etl_reports.py`)
 - [x] Report Service: API /reports с авторизацией (`report-service/`)
@@ -789,9 +792,9 @@ Kafka с двумя listener'ами: `INTERNAL` (kafka:29092, для Docker-се
 
 ### Задача 4.3 — KafkaEngine в ClickHouse
 
-→ `olap-db/init-cdc.sql`
+→ `olap-db/02-init-cdc.sql`
 
-Четыре объекта, выполняются после `init.sql` (алфавитный порядок):
+Четыре объекта, выполняются после `01-init.sql` (алфавитный порядок):
 
 **1. `crm_customers_queue`** (KafkaEngine) — виртуальная очередь, читает сырой JSON из топика `crm.public.customers`. Формат `JSONAsString` — каждое сообщение целиком как строка.
 
@@ -810,12 +813,12 @@ Kafka с двумя listener'ами: `INTERNAL` (kafka:29092, для Docker-се
 
 ### Задача 4.4 — Витрина MaterializedView
 
-→ `olap-db/init-cdc.sql` (секция 4)
+→ `olap-db/02-init-cdc.sql` (секция 4)
 
 **`user_reports_cdc`** (VIEW) — параллельная витрина, объединяющая CDC-данные CRM с телеметрией:
 
 ```sql
-SELECT ... FROM crm_customers FINAL AS c
+SELECT ... FROM (SELECT * FROM crm_customers FINAL) AS c
 INNER JOIN emg_sensor_data AS e ON c.id = e.user_id
 WHERE c._is_deleted = 0
 GROUP BY c.id, c.name, c.email, e.prosthesis_type
@@ -888,40 +891,103 @@ REPORT_VIEW: user_reports_cdc
 - [x] Sequence Diagram: CDC Data Flow (`diagrams/CDC_CRM_Flow.puml`)
 - [x] Конфигурация Debezium connector (`debezium/register-connector.json`)
 - [x] Скрипт регистрации коннектора (`debezium/register-connector.sh`)
-- [x] KafkaEngine + MaterializedView + CDC-реплика CRM (`olap-db/init-cdc.sql`)
-- [x] Витрина `user_reports_cdc` с JOIN CRM + телеметрия (`olap-db/init-cdc.sql`)
+- [x] KafkaEngine + MaterializedView + CDC-реплика CRM (`olap-db/02-init-cdc.sql`)
+- [x] Витрина `user_reports_cdc` с JOIN CRM + телеметрия (`olap-db/02-init-cdc.sql`)
 - [x] Report Service: параметризуемая витрина (`report-service/.../clickhouse/ClickHouseClient.java`)
 - [x] Kafka + Zookeeper + Kafka Connect в `docker-compose.yaml`
 - [x] CRM PostgreSQL: `wal_level=logical` в `docker-compose.yaml`
-- [ ] Интеграционный тест: full CDC pipeline. Требует `docker-compose up` + `register-connector.sh`.
+- [x] Интеграционный тест: full CDC pipeline — 1000 записей из CRM snapshot → ClickHouse. См. раздел «Результаты интеграционного тестирования».
 
 ---
 
 ## Запуск и проверка
 
-### Порядок запуска
+### Требования
+
+- Docker Engine 20.10+ и Docker Compose V2 (`docker compose`)
+- 32 GB RAM (рекомендуется, 15 сервисов + Kafka + ClickHouse)
+- Первый запуск: ~5 минут на скачивание образов, ~2-5 минут на сборку Java-сервисов
+
+### Полный сброс (если что-то пошло не так)
 
 ```bash
-# 1. Запустить все сервисы
-docker-compose up -d
+./reset.sh
+# Удаляет контейнеры, volumes, persistent data directories
+# После этого — повторный запуск с Фазы 1
+```
 
-# 2. Дождаться готовности Kafka Connect (healthcheck ~30-60 сек)
-docker-compose logs -f kafka-connect | grep "started"
+### Поэтапный запуск
 
-# 3. Зарегистрировать Debezium connector
+Проект содержит 16 сервисов с зависимостями. Запускаем в 6 фаз, чтобы каждый сервис стартовал после своих зависимостей.
+
+**Фаза 1: Инфраструктура (базы данных, брокеры, хранилища)**
+
+```bash
+docker compose up -d zookeeper
+docker compose up -d kafka
+docker compose up -d keycloak_db crm_db airflow_db openldap minio
+docker compose ps  # Все должны быть Running/Healthy
+```
+
+**Фаза 2: ClickHouse + Kafka Connect**
+
+```bash
+docker compose up -d olap_db
+docker compose up -d kafka-connect
+# Проверка таблиц ClickHouse:
+docker compose exec olap_db clickhouse-client --query "SHOW TABLES"
+# Ожидаем: emg_sensor_data, user_reports, crm_customers_queue, crm_customers, crm_customers_mv, user_reports_cdc
+```
+
+**Фаза 3: Keycloak**
+
+```bash
+docker compose up -d keycloak
+# Ждём ~30-60 сек (импорт realm), проверка:
+curl -s http://localhost:8080/realms/reports-realm | python3 -m json.tool | head -3
+```
+
+**Фаза 4: Java-сервисы (первая сборка ~2-5 мин)**
+
+```bash
+docker compose up -d report-service
+curl -s http://localhost:8001/health  # {"status":"UP","clickhouse":"connected","s3":"connected"}
+
+docker compose up -d bionicpro-auth
+curl -s http://localhost:8000/health  # {"status":"UP","sessions":0}
+```
+
+**Фаза 5: Frontend + CDN + Airflow**
+
+```bash
+docker compose up -d frontend nginx
+docker compose up -d airflow-init
+# Ждём завершения airflow-init (Exited 0):
+docker compose ps -a | grep airflow-init
+docker compose up -d airflow-webserver airflow-scheduler
+```
+
+**Фаза 6: Debezium connector (CDC)**
+
+```bash
 ./debezium/register-connector.sh
+# Ожидаем: connector RUNNING, task RUNNING
 
-# 4. Проверить статус
-curl -s http://localhost:8083/connectors/crm-connector/status | jq .
+# Проверка CDC-данных (через ~15 сек):
+docker compose exec olap_db clickhouse-client --query "SELECT count() FROM crm_customers"
+# Ожидаем: 1000 (initial snapshot из CRM)
+```
 
-# 5. Проверить, что данные попали в ClickHouse
-docker exec -it $(docker ps -q -f name=olap_db) \
-    clickhouse-client --query "SELECT count() FROM crm_customers"
-# Должно вернуть 1000 (initial snapshot)
+### Остановка и продолжение работы
 
-# 6. Проверить витрину
-docker exec -it $(docker ps -q -f name=olap_db) \
-    clickhouse-client --query "SELECT * FROM user_reports_cdc LIMIT 5"
+```bash
+# Остановить с сохранением данных (для продолжения завтра):
+docker compose stop
+
+# Возобновить:
+docker compose start
+# Если frontend не стартовал (nginx resolve error):
+docker compose restart frontend
 ```
 
 ### Порты сервисов
@@ -939,3 +1005,100 @@ docker exec -it $(docker ps -q -f name=olap_db) \
 | 9000 | MinIO | S3 API |
 | 9001 | MinIO | Console UI |
 | 9092 | Kafka | External listener (хост) |
+
+### Тестовые пользователи
+
+| Username | Пароль | Роль | CRM user_id |
+|----------|--------|------|-------------|
+| prothetic1 | prothetic123 | prothetic_user | 1 |
+| prothetic2 | prothetic123 | prothetic_user | 2 |
+| prothetic3 | prothetic123 | prothetic_user | 3 |
+| user1 | password123 | user | — |
+| user2 | password123 | user | — |
+| admin1 | admin123 | administrator | — |
+
+При первом входе каждому пользователю предлагается настроить TOTP (Google Authenticator / FreeOTP / AndOTP).
+
+---
+
+## Результаты интеграционного тестирования
+
+### Smoke test: полный E2E flow
+
+Тестирование проводилось на Manjaro Linux, i7, 32 GB RAM.
+
+**Пройденный сценарий:**
+
+1. Открыть `http://localhost:3000` → отображается страница BionicPRO (`screenshots/screen1.png`)
+2. Нажать «Получить отчёт» → BFF возвращает 401, предлагает войти (`screenshots/screen2.png`)
+3. Нажать «Войти» → редирект на Keycloak (`localhost:8080`) с PKCE (`code_challenge`, `code_challenge_method=S256`) (`screenshots/screen3.png`)
+4. Ввести `prothetic1` / `prothetic123` → Keycloak предлагает настроить TOTP (`screenshots/screen4.png`)
+5. Отсканировать QR-код → ввести одноразовый код (`screenshots/screen5.png`)
+6. Keycloak → callback → BFF создаёт сессию → redirect на фронтенд (`screenshots/screen6.png`)
+7. Нажать «Получить отчёт» → отображается отчёт из CDC-витрины (`screenshots/screen7.png`, `screenshots/screen8.png`)
+
+**Результат:** Svetlana Lopez, два протеза (arm + hand), данные из `user_reports_cdc` (CDC pipeline, near real-time). Отчёт кэширован в S3, CDN URL доступен.
+
+### Проблемы, найденные при запуске, и их решения
+
+За два вечера тестирования было обнаружено и исправлено 12 проблем. Все фиксы внесены в репозиторий.
+
+#### Критические (блокировали запуск)
+
+| # | Проблема | Симптом | Причина | Фикс |
+|---|----------|---------|---------|------|
+| 1 | Порядок init-скриптов ClickHouse | `02-init-cdc.sql` ссылается на несуществующую таблицу | ClickHouse выполняет скрипты из `/docker-entrypoint-initdb.d/` в алфавитном порядке. `init-cdc.sql` < `init.sql` | Переименование: `init.sql` → `01-init.sql`, `init-cdc.sql` → `02-init-cdc.sql` |
+| 2 | Перепутаны nginx-конфиги | Frontend контейнер получал CDN-конфиг вместо конфига раздачи React | CDN-конфиг ошибочно лежал в `frontend/nginx.conf` | Создана директория `nginx/`, конфиги разделены. В `frontend/nginx.conf` добавлен reverse proxy к BFF |
+| 3 | Keycloak: пустые массивы в realm import | `Index 0 out of bounds for length 0` при старте Keycloak | LDAP mapper: `"groups.ldap.filter": []`, `"mapped.group.attributes": []`. Keycloak делает `array[0]` | Заменены `[]` → `[""]` |
+| 4 | JAR signature conflict | `SecurityException: Invalid signature file digest for Manifest main attributes` | `maven-shade-plugin` без фильтра подписей. MinIO SDK тянёт подписанные JAR'ы (Bouncy Castle) | Добавлен `<filter>` исключающий `META-INF/*.SF`, `*.DSA`, `*.RSA` |
+| 5 | Debezium JSON без обёртки `payload` | CDC MV парсит все поля как нули (0, пустые строки) | `schemas.enable=false` — Debezium отправляет `{"before":...,"after":...}` без `{"payload":{...}}`. MV искал `JSONExtract(raw, 'payload', 'after', ...)` | Убран уровень `'payload'` из всех `JSONExtract`. Поле `age` (Debezium decimal → base64) заменено на `toUInt8(0)` |
+| 6 | Keycloak URL в браузере | Браузер пытается открыть `http://keycloak:8080/...` (внутренний Docker-хостнейм) | BFF использовал один `KEYCLOAK_URL` и для server-side token exchange, и для browser redirect | Разделение: `KEYCLOAK_URL` (internal) + `KEYCLOAK_EXTERNAL_URL` (browser). `KeycloakClient` принимает оба URL |
+| 7 | BFF проксирует `/api/reports/me` → 404 | Report Service не находит endpoint | BFF проксировал путь как есть (`/api/reports/me`), а Report Service слушает на `/reports/me` | `ProxyHandler`: `path.startsWith("/api") ? path.substring(4) : path` |
+
+#### Некритические (мешали, но не блокировали)
+
+| # | Проблема | Фикс |
+|---|----------|------|
+| 8 | Zookeeper healthcheck не проходит | `cp-zookeeper:7.5.3` не содержит `nc`. Заменено на `curl -sf http://localhost:8080/commands/ruok` |
+| 9 | CRM init.sql: Permission denied | Права файла `crm-db/init.sql` не позволяли postgres читать внутри контейнера. `chmod 644` |
+| 10 | ClickHouse 24.8: `FROM table FINAL AS c` — syntax error | ClickHouse 24.8 не поддерживает `FINAL AS alias`. Обёрнуто в подзапрос: `FROM (SELECT * FROM crm_customers FINAL) AS c` |
+| 11 | Java 25: `unsupported URI` с подчёркиванием в hostname | `http://olap_db:8123` невалидный по RFC. Добавлен сетевой alias `olapdb` в docker-compose |
+| 12 | Frontend стартует раньше BFF | nginx не может зарезолвить upstream `bionicpro-auth`. Добавлен `depends_on: bionicpro-auth` |
+
+#### Косметические
+
+| # | Проблема | Фикс |
+|---|----------|------|
+| 13 | `version: '3.8'` deprecated | Удалено (Docker Compose V2 игнорирует) |
+| 14 | `clickhouse/clickhouse-server:latest` | Зафиксировано: `clickhouse/clickhouse-server:24.8` (LTS) |
+| 15 | PostgreSQL без healthcheck | Добавлены healthcheck для `keycloak_db`, `crm_db`, `airflow_db` + `condition: service_healthy` в depends_on |
+| 16 | Airflow init YAML parsing | `command: >` складывал аргументы. Заменено на `command: - -c - |` (block scalar) |
+
+### Известные ограничения и рекомендации для production
+
+#### Маппинг Keycloak UUID → CRM user_id
+
+**Текущее решение (demo):** BFF извлекает числовой ID из username регулярным выражением (`prothetic1` → `1`) и передаёт в заголовке `X-CRM-User-Id`. Report Service использует этот заголовок для запроса к ClickHouse.
+
+**Production-решение:** В Keycloak добавить User Attribute `crm_user_id` (числовой ID пользователя в CRM). Через Protocol Mapper (тип `User Attribute`) включить его как claim в `id_token` и `access_token`. BFF и Report Service читают `crm_user_id` напрямую из JWT — никаких хаков с парсингом username.
+
+```
+Keycloak Admin → Users → prothetic1 → Attributes → crm_user_id = 1
+Keycloak Admin → Clients → reports-frontend → Client Scopes → Mappers → Add:
+  Name: crm-user-id
+  Mapper Type: User Attribute
+  User Attribute: crm_user_id
+  Token Claim Name: crm_user_id
+  Claim JSON Type: int
+  Add to ID token: ON
+  Add to access token: ON
+```
+
+#### Другие production-рекомендации
+
+- **Session Store:** Заменить `InMemorySessionStore` (ConcurrentHashMap) на Redis. Интерфейс `SessionStore` уже абстрагирован — одна реализация
+- **HTTPS:** Все URL сейчас HTTP. В production: TLS termination на reverse proxy (nginx/traefik), `Secure` флаг cookie
+- **Яндекс ID:** Заменить плейсхолдеры `YANDEX_CLIENT_ID_PLACEHOLDER` на реальные credentials из https://oauth.yandex.ru/
+- **ClickHouse FINAL:** В `user_reports_cdc` используется подзапрос с `FINAL` — на больших объёмах это дорого. В production: периодический `OPTIMIZE TABLE crm_customers FINAL` + убрать `FINAL` из VIEW
+- **Kafka consumer group:** При `reset.sh` нужно инкрементировать `kafka_group_name` в `02-init-cdc.sql` (offset хранится в Kafka, не в ClickHouse)
+- **Debezium `age` field:** Поле `age` типа `NUMERIC` кодируется Debezium как base64 (`{"scale":0,"value":"Ew=="}`). Текущий workaround: `toUInt8(0)`. Production: кастомный SMT (Single Message Transform) в Kafka Connect или обработка на стороне ClickHouse MV
